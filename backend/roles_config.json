@@ -1,0 +1,22 @@
+{
+  "roles": [
+    {
+      "id": "staff",
+      "name": "Staff",
+      "description": "Tao video/anh, xem lich su ca nhan, su dung tool co ban",
+      "permissions": ["create_video", "create_image", "view_own_history", "view_library"]
+    },
+    {
+      "id": "qc_manager",
+      "name": "QC Manager",
+      "description": "Duyet/tu choi san pham, xem lich su tat ca staff, dashboard hieu suat",
+      "permissions": ["create_video", "create_image", "view_own_history", "view_library", "qc_approve", "qc_reject", "view_all_history", "view_dashboard"]
+    },
+    {
+      "id": "admin",
+      "name": "Admin",
+      "description": "Full quyen: quan ly user, API key, xem tat ca, cau hinh he thong",
+      "permissions": ["create_video", "create_image", "view_own_history", "view_library", "qc_approve", "qc_reject", "view_all_history", "view_dashboard", "manage_users", "manage_keys", "manage_settings", "view_billing"]
+    }
+  ]
+}

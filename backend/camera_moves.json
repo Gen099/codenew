@@ -1,0 +1,14 @@
+[
+  {"id": "static", "name": "Static Shot", "prompt": "static camera, no movement, locked off", "icon": "📷"},
+  {"id": "push_in", "name": "Slow Push In", "prompt": "slow cinematic push in, subtle zoom forward, smooth", "icon": "🔭"},
+  {"id": "pull_out", "name": "Pull Out", "prompt": "camera slowly pulls back, reveal shot, smooth and cinematic", "icon": "⬅"},
+  {"id": "pan_left", "name": "Pan Left", "prompt": "smooth horizontal camera pan to the left, steady", "icon": "◀"},
+  {"id": "pan_right", "name": "Pan Right", "prompt": "smooth horizontal camera pan to the right, steady", "icon": "▶"},
+  {"id": "tilt_up", "name": "Tilt Up", "prompt": "camera slowly tilts upward, smooth vertical movement", "icon": "⬆"},
+  {"id": "tilt_down", "name": "Tilt Down", "prompt": "camera slowly tilts downward, smooth vertical movement", "icon": "⬇"},
+  {"id": "orbit", "name": "Orbit Shot", "prompt": "cinematic arc shot slowly orbiting around the subject, 360 pan", "icon": "🔄"},
+  {"id": "drone", "name": "Drone Fly-over", "prompt": "aerial drone shot, gently ascending, wide establishing view", "icon": "🚁"},
+  {"id": "tracking", "name": "Low Angle Track", "prompt": "low angle tracking shot following the subject, dynamic", "icon": "🎯"},
+  {"id": "handheld", "name": "Handheld Natural", "prompt": "slight handheld camera shake, natural organic movement, documentary style", "icon": "✋"},
+  {"id": "walkthrough", "name": "Cinematic Walkthrough", "prompt": "ultra-smooth steadicam walkthrough, glide forward through the scene, cinematic", "icon": "🚶"}
+]

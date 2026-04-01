@@ -1,0 +1,15 @@
+{
+  "name": "faistudio-uat-e2e",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Playwright UAT automation for F-Aistudio production link",
+  "scripts": {
+    "uat:e2e": "playwright test",
+    "uat:e2e:headed": "playwright test --headed",
+    "uat:e2e:ui": "playwright test --ui"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0"
+  }
+}
+

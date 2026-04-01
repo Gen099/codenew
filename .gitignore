@@ -1,0 +1,28 @@
+# Runtime
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+
+# Data (runtime generated)
+data/*.db
+data/*.json
+logs/
+backups/
+
+# Environment (secrets)
+.env.production
+.secrets/
+backend/.env
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+
+# IDE
+.vscode/
+.idea/

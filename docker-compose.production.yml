@@ -1,0 +1,71 @@
+name: faistudio-production
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: faistudio-postgres
+    restart: unless-stopped
+    env_file:
+      - ${ENV_FILE_PATH:-.env.production}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U videotool -d videotool"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - faistudio_net
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: faistudio-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - ${ENV_FILE_PATH:-.env.production}
+    environment:
+      VIDEOTOOL_MODE: server
+      VIDEOTOOL_BACKEND_HOST: 0.0.0.0
+      VIDEOTOOL_BACKEND_PORT: 8012
+      VIDEOTOOL_BACKEND_RELOAD: 0
+    volumes:
+      - app_data:/app/data
+      - app_logs:/app/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8012/docs > /dev/null || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    networks:
+      - faistudio_net
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: faistudio-nginx
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${PUBLIC_HTTP_PORT:-8080}:80"
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./frontend:/usr/share/nginx/html:ro
+    networks:
+      - faistudio_net
+
+volumes:
+  postgres_data:
+  app_data:
+  app_logs:
+
+networks:
+  faistudio_net:
+    driver: bridge

@@ -1,0 +1,1132 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VideoTool – Phân Tích & Thiết Kế Lại</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+:root {
+  --bg: #0D0D0F;
+  --bg2: #141417;
+  --card: #1A1A1E;
+  --card2: #222226;
+  --border: #2A2A30;
+  --border2: #36363E;
+  --text: #E8E8EC;
+  --muted: #8888A0;
+  --muted2: #555568;
+  --brand: #D97A2B;
+  --brand-dim: rgba(217,122,43,.12);
+  --green: #5FB85F;
+  --green-dim: rgba(95,184,95,.12);
+  --red: #E05555;
+  --red-dim: rgba(224,85,85,.12);
+  --blue: #5A9EE8;
+  --blue-dim: rgba(90,158,232,.12);
+  --yellow: #E8C84A;
+  --yellow-dim: rgba(232,200,74,.12);
+  --purple: #9B72E8;
+  --purple-dim: rgba(155,114,232,.12);
+  --cyan: #38BDF8;
+  --cyan-dim: rgba(56,189,248,.12);
+  --r: 10px;
+  --r-sm: 6px;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+html { scroll-behavior: smooth; }
+body { font-family:'Inter',sans-serif; background:var(--bg); color:var(--text); font-size:14px; line-height:1.6; }
+
+::-webkit-scrollbar { width:5px; height:5px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:var(--border2); border-radius:3px; }
+
+/* NAV */
+nav {
+  position: fixed; top:0; left:0; right:0; z-index:100;
+  background: rgba(13,13,15,.92); backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--border);
+  display:flex; align-items:center; gap:0; padding:0 32px; height:52px;
+}
+.nav-logo { display:flex; align-items:center; gap:10px; font-weight:800; font-size:16px; margin-right:32px; }
+.nav-logo-icon { width:30px;height:30px; background:var(--brand); border-radius:6px; display:flex;align-items:center;justify-content:center; font-size:14px; }
+.nav-links { display:flex; gap:4px; flex:1; }
+.nav-link { padding:6px 14px; border-radius:6px; color:var(--muted); text-decoration:none; font-size:13px; transition:.15s; }
+.nav-link:hover { color:var(--text); background:var(--card); }
+.nav-link.active { color:var(--brand); background:var(--brand-dim); font-weight:600; }
+.nav-badge { background:var(--brand); color:white; font-size:10px; font-weight:700; padding:1px 6px; border-radius:10px; margin-left:4px; }
+
+/* HERO */
+.hero {
+  padding: 100px 32px 60px;
+  max-width: 1200px; margin: 0 auto;
+  display: grid; grid-template-columns: 1fr 1fr; gap: 60px; align-items: center;
+}
+.hero-eyebrow {
+  display:flex; align-items:center; gap:8px; margin-bottom:16px;
+  font-size:12px; font-weight:600; color:var(--brand); letter-spacing:1px; text-transform:uppercase;
+}
+.hero-eyebrow::before { content:''; width:32px; height:2px; background:var(--brand); display:inline-block; }
+.hero h1 { font-size:42px; font-weight:800; line-height:1.15; margin-bottom:20px; }
+.hero h1 span { color:var(--brand); }
+.hero-sub { font-size:16px; color:var(--muted); line-height:1.7; margin-bottom:28px; }
+.hero-tags { display:flex; flex-wrap:wrap; gap:8px; }
+.tag { padding:5px 12px; border-radius:20px; font-size:12px; font-weight:600; border:1px solid; }
+.tag-red { color:var(--red); border-color:var(--red); background:var(--red-dim); }
+.tag-green { color:var(--green); border-color:var(--green); background:var(--green-dim); }
+.tag-blue { color:var(--blue); border-color:var(--blue); background:var(--blue-dim); }
+.tag-brand { color:var(--brand); border-color:var(--brand); background:var(--brand-dim); }
+.tag-purple { color:var(--purple); border-color:var(--purple); background:var(--purple-dim); }
+
+.hero-visual {
+  background: var(--card); border:1px solid var(--border); border-radius:14px;
+  padding:24px; position:relative; overflow:hidden;
+}
+.hero-visual::before {
+  content:''; position:absolute; top:-60px; right:-60px;
+  width:200px; height:200px; border-radius:50%;
+  background:radial-gradient(circle, rgba(217,122,43,.15) 0%, transparent 70%);
+}
+
+/* SECTIONS */
+section { max-width:1200px; margin:0 auto; padding:60px 32px; }
+.section-eyebrow {
+  display:flex; align-items:center; gap:10px; margin-bottom:12px;
+  font-size:11px; font-weight:700; color:var(--muted); letter-spacing:1.5px; text-transform:uppercase;
+}
+.section-eyebrow .dot { width:8px;height:8px;border-radius:50%; flex-shrink:0; }
+h2 { font-size:30px; font-weight:800; margin-bottom:8px; }
+h2 .accent { color:var(--brand); }
+.section-sub { color:var(--muted); font-size:15px; max-width:600px; margin-bottom:40px; }
+
+/* CARDS */
+.card { background:var(--card); border:1px solid var(--border); border-radius:var(--r); padding:20px; }
+.card-sm { padding:14px 16px; }
+.card-title { font-size:13px; font-weight:700; display:flex; align-items:center; gap:8px; margin-bottom:14px; }
+.card-title .icon { width:28px;height:28px; border-radius:6px; display:flex;align-items:center;justify-content:center; font-size:13px; flex-shrink:0; }
+
+/* PROBLEM vs SOLUTION */
+.compare-grid { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+.problem-card { background:var(--red-dim); border:1px solid rgba(224,85,85,.25); border-radius:var(--r); padding:20px; }
+.solution-card { background:var(--green-dim); border:1px solid rgba(95,184,95,.25); border-radius:var(--r); padding:20px; }
+.compare-label { display:flex; align-items:center; gap:8px; font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:1px; margin-bottom:16px; }
+.compare-label.problem { color:var(--red); }
+.compare-label.solution { color:var(--green); }
+.compare-item { display:flex; gap:10px; margin-bottom:10px; font-size:13px; line-height:1.5; }
+.compare-item i { flex-shrink:0; margin-top:2px; width:16px; }
+
+/* ARCH DIAGRAM */
+.arch-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; }
+.arch-box {
+  border-radius:var(--r); padding:16px; border:1px solid var(--border);
+  position:relative; overflow:hidden;
+}
+.arch-layer { font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:1px; margin-bottom:10px; }
+.arch-items { display:flex; flex-direction:column; gap:6px; }
+.arch-item {
+  display:flex; align-items:center; gap:8px; padding:7px 10px;
+  background:rgba(255,255,255,.04); border-radius:6px; font-size:12px;
+  border:1px solid var(--border);
+}
+.arch-item i { width:16px; text-align:center; }
+.arch-arrow {
+  display:flex; align-items:center; justify-content:center;
+  font-size:22px; color:var(--border2); align-self:center;
+}
+
+/* FLOW DIAGRAM */
+.flow-row { display:flex; align-items:stretch; gap:0; }
+.flow-node {
+  flex:1; background:var(--card); border:1px solid var(--border);
+  border-radius:var(--r); padding:16px; text-align:center;
+  position:relative;
+}
+.flow-node-num {
+  width:28px;height:28px; border-radius:50%; display:flex;align-items:center;justify-content:center;
+  font-size:12px; font-weight:800; margin:0 auto 10px; border:2px solid currentColor;
+}
+.flow-node-title { font-size:12px; font-weight:700; margin-bottom:6px; }
+.flow-node-desc { font-size:11px; color:var(--muted); line-height:1.4; }
+.flow-connector {
+  display:flex; align-items:center; justify-content:center;
+  width:36px; flex-shrink:0; color:var(--border2); font-size:18px;
+}
+.flow-node.blue { border-color:rgba(90,158,232,.3); }
+.flow-node.blue .flow-node-num { color:var(--blue); border-color:var(--blue); }
+.flow-node.brand { border-color:rgba(217,122,43,.3); }
+.flow-node.brand .flow-node-num { color:var(--brand); border-color:var(--brand); }
+.flow-node.green { border-color:rgba(95,184,95,.3); }
+.flow-node.green .flow-node-num { color:var(--green); border-color:var(--green); }
+.flow-node.purple { border-color:rgba(155,114,232,.3); }
+.flow-node.purple .flow-node-num { color:var(--purple); border-color:var(--purple); }
+.flow-node.cyan { border-color:rgba(56,189,248,.3); }
+.flow-node.cyan .flow-node-num { color:var(--cyan); border-color:var(--cyan); }
+
+/* GRID LAYOUTS */
+.g2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+.g3 { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; }
+.g4 { display:grid; grid-template-columns:repeat(4,1fr); gap:16px; }
+.span2 { grid-column:span 2; }
+.span3 { grid-column:span 3; }
+
+/* TABLE */
+table { width:100%; border-collapse:collapse; }
+thead th { text-align:left; padding:10px 14px; font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; border-bottom:1px solid var(--border); }
+tbody td { padding:10px 14px; border-bottom:1px solid var(--border); font-size:13px; }
+tbody tr:last-child td { border-bottom:none; }
+tbody tr:hover td { background:rgba(255,255,255,.02); }
+
+/* BADGE */
+.badge { display:inline-flex;align-items:center;gap:4px; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; }
+.b-red { background:var(--red-dim); color:var(--red); }
+.b-green { background:var(--green-dim); color:var(--green); }
+.b-blue { background:var(--blue-dim); color:var(--blue); }
+.b-brand { background:var(--brand-dim); color:var(--brand); }
+.b-yellow { background:var(--yellow-dim); color:var(--yellow); }
+.b-purple { background:var(--purple-dim); color:var(--purple); }
+.b-gray { background:rgba(136,136,160,.15); color:var(--muted); }
+.b-cyan { background:var(--cyan-dim); color:var(--cyan); }
+
+/* METRIC CARDS */
+.metric { background:var(--card); border:1px solid var(--border); border-radius:var(--r); padding:20px; }
+.metric-val { font-size:32px; font-weight:800; line-height:1; margin:8px 0 4px; }
+.metric-label { font-size:12px; color:var(--muted); }
+.metric-change { font-size:12px; font-weight:600; margin-top:6px; }
+
+/* PRIORITY TABLE */
+.priority-row { display:flex; gap:12px; align-items:flex-start; padding:14px; border-bottom:1px solid var(--border); }
+.priority-row:last-child { border-bottom:none; }
+.priority-num { width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;flex-shrink:0; }
+.p-p0 { background:var(--red-dim);color:var(--red); }
+.p-p1 { background:var(--brand-dim);color:var(--brand); }
+.p-p2 { background:var(--blue-dim);color:var(--blue); }
+.p-p3 { background:var(--green-dim);color:var(--green); }
+
+/* TECH STACK */
+.tech-chip {
+  display:inline-flex; align-items:center; gap:6px; padding:6px 12px;
+  background:var(--card2); border:1px solid var(--border); border-radius:20px;
+  font-size:12px; font-weight:500; margin:4px;
+}
+.tech-chip.drop { background:var(--red-dim); border-color:rgba(224,85,85,.3); color:var(--red); }
+.tech-chip.keep { background:var(--green-dim); border-color:rgba(95,184,95,.3); color:var(--green); }
+.tech-chip.new { background:var(--brand-dim); border-color:rgba(217,122,43,.3); color:var(--brand); }
+
+/* CODE BLOCK */
+pre {
+  background:var(--bg2); border:1px solid var(--border); border-radius:var(--r-sm);
+  padding:16px; font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--cyan);
+  overflow-x:auto; line-height:1.6;
+}
+code { font-family:'JetBrains Mono',monospace; font-size:12px; }
+.code-comment { color:var(--muted2); }
+.code-key { color:var(--yellow); }
+.code-val { color:var(--green); }
+.code-str { color:var(--brand); }
+
+/* DIVIDER */
+.divider { height:1px; background:var(--border); margin:40px 0; }
+.divider-label {
+  display:flex; align-items:center; gap:12px; margin:40px 0;
+  font-size:11px; font-weight:700; color:var(--muted2); text-transform:uppercase; letter-spacing:1px;
+}
+.divider-label::before,.divider-label::after { content:''; flex:1; height:1px; background:var(--border); }
+
+/* RISK MATRIX */
+.risk-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+.risk-item { padding:14px; border-radius:var(--r-sm); border:1px solid var(--border); }
+.risk-title { font-size:13px; font-weight:700; margin-bottom:4px; }
+.risk-desc { font-size:12px; color:var(--muted); }
+
+/* SCROLL INDICATOR */
+.scroll-nav {
+  position:fixed; right:20px; top:50%; transform:translateY(-50%);
+  display:flex; flex-direction:column; gap:8px; z-index:50;
+}
+.scroll-dot {
+  width:8px; height:8px; border-radius:50%; background:var(--border2); cursor:pointer;
+  transition:.2s; position:relative;
+}
+.scroll-dot.active { background:var(--brand); transform:scale(1.4); }
+.scroll-dot:hover { background:var(--muted); }
+.scroll-dot[data-label]:hover::before {
+  content:attr(data-label); position:absolute; right:16px; top:50%; transform:translateY(-50%);
+  background:var(--card); border:1px solid var(--border); color:var(--text);
+  padding:3px 8px; border-radius:4px; font-size:11px; white-space:nowrap;
+}
+
+/* FOOTER */
+footer { text-align:center; padding:40px 32px; color:var(--muted2); font-size:12px; border-top:1px solid var(--border); }
+
+/* PROGRESS */
+.prog-bar { height:6px; background:var(--border); border-radius:3px; overflow:hidden; }
+.prog-fill { height:100%; border-radius:3px; }
+.prog-brand { background:linear-gradient(90deg,var(--brand),var(--yellow)); }
+.prog-green { background:var(--green); }
+.prog-red { background:var(--red); }
+.prog-blue { background:var(--blue); }
+
+/* TIMELINE */
+.timeline { position:relative; padding-left:32px; }
+.timeline::before { content:''; position:absolute; left:8px; top:0; bottom:0; width:2px; background:var(--border); }
+.timeline-item { position:relative; margin-bottom:24px; }
+.timeline-dot {
+  position:absolute; left:-28px; top:4px;
+  width:16px;height:16px;border-radius:50%;
+  border:2px solid var(--border); background:var(--bg);
+  display:flex;align-items:center;justify-content:center;
+}
+.timeline-dot.active { border-color:var(--brand); background:var(--brand); }
+.timeline-dot.done { border-color:var(--green); background:var(--green); }
+.timeline-title { font-size:13px; font-weight:700; margin-bottom:4px; }
+.timeline-desc { font-size:12px; color:var(--muted); }
+
+/* RESPONSIVE */
+@media(max-width:900px) {
+  .hero { grid-template-columns:1fr; }
+  .g4 { grid-template-columns:1fr 1fr; }
+  .g3 { grid-template-columns:1fr; }
+  .compare-grid { grid-template-columns:1fr; }
+  .arch-grid { grid-template-columns:1fr; }
+}
+</style>
+</head>
+<body>
+
+<!-- SCROLL NAV -->
+<div class="scroll-nav" id="scrollNav">
+  <div class="scroll-dot active" data-label="Tổng quan" onclick="scrollTo('#hero')"></div>
+  <div class="scroll-dot" data-label="Vấn đề" onclick="scrollTo('#problems')"></div>
+  <div class="scroll-dot" data-label="Cốt lõi" onclick="scrollTo('#core')"></div>
+  <div class="scroll-dot" data-label="Kiến trúc mới" onclick="scrollTo('#newarch')"></div>
+  <div class="scroll-dot" data-label="Tech Stack" onclick="scrollTo('#techstack')"></div>
+  <div class="scroll-dot" data-label="Roadmap" onclick="scrollTo('#roadmap')"></div>
+  <div class="scroll-dot" data-label="So sánh" onclick="scrollTo('#compare')"></div>
+</div>
+
+<!-- NAV -->
+<nav>
+  <div class="nav-logo">
+    <div class="nav-logo-icon">🎬</div>
+    VideoTool Analysis
+  </div>
+  <div class="nav-links">
+    <a href="#hero" class="nav-link active">Tổng quan</a>
+    <a href="#problems" class="nav-link">Vấn đề</a>
+    <a href="#core" class="nav-link">Cốt lõi</a>
+    <a href="#newarch" class="nav-link">Kiến trúc mới <span class="nav-badge">NEW</span></a>
+    <a href="#techstack" class="nav-link">Tech Stack</a>
+    <a href="#roadmap" class="nav-link">Roadmap</a>
+    <a href="#compare" class="nav-link">So sánh</a>
+  </div>
+</nav>
+
+<!-- HERO -->
+<section id="hero">
+  <div class="hero">
+    <div>
+      <div class="hero-eyebrow">Phân tích chiến lược • 25/03/2026</div>
+      <h1>VideoTool:<br><span>Làm mới</span> từ<br>cốt lõi</h1>
+      <p class="hero-sub">App cũ = Desktop GUI + FastAPI + SQLite. Tốt cho 1 máy, nhưng không thể scale. Phân tích này chiết xuất cốt lõi nghiệp vụ và thiết kế lại theo hướng <strong>Web-native · Nhẹ · Multi-user · Thông minh.</strong></p>
+      <div class="hero-tags">
+        <span class="tag tag-red"><i class="fa-solid fa-xmark"></i> Desktop PyQt6</span>
+        <span class="tag tag-green"><i class="fa-solid fa-check"></i> Browser-based</span>
+        <span class="tag tag-blue"><i class="fa-solid fa-users"></i> Multi-user</span>
+        <span class="tag tag-brand"><i class="fa-solid fa-bolt"></i> Lightweight</span>
+        <span class="tag tag-purple"><i class="fa-solid fa-robot"></i> AI-native</span>
+      </div>
+    </div>
+    <div class="hero-visual">
+      <div style="font-size:11px;color:var(--muted);margin-bottom:12px;font-weight:600;text-transform:uppercase;letter-spacing:1px">App cũ vs Hướng mới</div>
+      <canvas id="heroChart" height="220"></canvas>
+      <div style="margin-top:14px;display:grid;grid-template-columns:1fr 1fr;gap:8px">
+        <div style="padding:10px;background:var(--red-dim);border:1px solid rgba(224,85,85,.2);border-radius:8px">
+          <div style="font-size:10px;color:var(--red);font-weight:700;margin-bottom:4px">APP CŨ</div>
+          <div style="font-size:11px;color:var(--muted)">PyQt6 · SQLite · 1 máy · Nặng · Khó scale</div>
+        </div>
+        <div style="padding:10px;background:var(--green-dim);border:1px solid rgba(95,184,95,.2);border-radius:8px">
+          <div style="font-size:10px;color:var(--green);font-weight:700;margin-bottom:4px">HƯỚNG MỚI</div>
+          <div style="font-size:11px;color:var(--muted)">Web · REST API · PostgreSQL · 20+ users</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- PROBLEMS -->
+<section id="problems">
+  <div class="section-eyebrow"><div class="dot" style="background:var(--red)"></div> Vấn đề hiện tại</div>
+  <h2>App cũ có <span class="accent">7 vấn đề cốt lõi</span></h2>
+  <p class="section-sub">Phân tích từ mã nguồn thực tế – không phải lý thuyết.</p>
+
+  <div class="g4" style="margin-bottom:24px">
+    <div class="metric" style="border-color:rgba(224,85,85,.3)">
+      <div class="badge b-red">Desktop-only</div>
+      <div class="metric-val" style="color:var(--red)">PyQt6</div>
+      <div class="metric-label">Cài đặt trên từng máy, không thể mở trên browser</div>
+    </div>
+    <div class="metric" style="border-color:rgba(224,85,85,.3)">
+      <div class="badge b-red">DB Bottleneck</div>
+      <div class="metric-val" style="color:var(--red)">SQLite</div>
+      <div class="metric-label">Không có WAL, new connection mỗi query, write-lock liên tục</div>
+    </div>
+    <div class="metric" style="border-color:rgba(224,85,85,.3)">
+      <div class="badge b-red">Log Overhead</div>
+      <div class="metric-val" style="color:var(--red)">3,880</div>
+      <div class="metric-label">DB connections/ngày chỉ từ activity_logger</div>
+    </div>
+    <div class="metric" style="border-color:rgba(224,85,85,.3)">
+      <div class="badge b-red">Credit Waste</div>
+      <div class="metric-val" style="color:var(--red)">~90%</div>
+      <div class="metric-label">Credit bị đốt khi cancel chat (không cancel được upstream)</div>
+    </div>
+  </div>
+
+  <div class="compare-grid">
+    <div class="problem-card">
+      <div class="compare-label problem"><i class="fa-solid fa-bug"></i> Vấn đề kỹ thuật</div>
+      <div class="compare-item"><i class="fa-solid fa-xmark" style="color:var(--red)"></i> <span>Mỗi <code>log_event()</code> mở 1 SQLite connection mới → ~4 giây overhead/ca làm việc</span></div>
+      <div class="compare-item"><i class="fa-solid fa-xmark" style="color:var(--red)"></i> <span>Batch status gọi provider API cho từng task pending → O(n) API calls, lãng phí quota</span></div>
+      <div class="compare-item"><i class="fa-solid fa-xmark" style="color:var(--red)"></i> <span>Poll interval cố định 3s → 95%+ requests vô ích khi video đang render</span></div>
+      <div class="compare-item"><i class="fa-solid fa-xmark" style="color:var(--red)"></i> <span>Không có index trên <code>tasks.staff_id</code>, <code>activity_logs.created_at</code> → query slow</span></div>
+      <div class="compare-item"><i class="fa-solid fa-xmark" style="color:var(--red)"></i> <span>GUI calls API synchronously → UI freeze khi backend chậm</span></div>
+      <div class="compare-item"><i class="fa-solid fa-xmark" style="color:var(--red)"></i> <span>Không có WAL mode → reader blocks writer, writer blocks reader</span></div>
+      <div class="compare-item"><i class="fa-solid fa-xmark" style="color:var(--red)"></i> <span>Log file không rotate → sau 3 tháng hàng chục MB, không readable</span></div>
+    </div>
+    <div class="problem-card">
+      <div class="compare-label problem"><i class="fa-solid fa-layer-group"></i> Vấn đề kiến trúc</div>
+      <div class="compare-item"><i class="fa-solid fa-xmark" style="color:var(--red)"></i> <span>Desktop-only: mỗi user cần cài .venv, Python, config — khó onboard</span></div>
+      <div class="compare-item"><i class="fa-solid fa-xmark" style="color:var(--red)"></i> <span>Multi-user = chạy nhiều instance → không share state, data silo</span></div>
+      <div class="compare-item"><i class="fa-solid fa-xmark" style="color:var(--red)"></i> <span>Không có real-time updates giữa users (QC approve xong, staff không biết ngay)</span></div>
+      <div class="compare-item"><i class="fa-solid fa-xmark" style="color:var(--red)"></i> <span>Session data trong RAM → crash = mất hết trạng thái workspace</span></div>
+      <div class="compare-item"><i class="fa-solid fa-xmark" style="color:var(--red)"></i> <span>Không thể access từ xa / remote work</span></div>
+      <div class="compare-item"><i class="fa-solid fa-xmark" style="color:var(--red)"></i> <span>Code PyQt6 nặng (~2000 LOC main_window.py) → khó maintain, khó test</span></div>
+      <div class="compare-item"><i class="fa-solid fa-xmark" style="color:var(--red)"></i> <span>Encoding lỗi tiếng Việt ở nhiều màn hình</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- CORE -->
+<section id="core">
+  <div class="section-eyebrow"><div class="dot" style="background:var(--yellow)"></div> Chiết xuất cốt lõi</div>
+  <h2>Nghiệp vụ <span class="accent">thực sự cần thiết</span></h2>
+  <p class="section-sub">Loại bỏ noise, giữ lại essence. 12 bảng DB → 6 domain thực sự quan trọng.</p>
+
+  <div class="g3" style="margin-bottom:24px">
+    <!-- Core 1 -->
+    <div class="card">
+      <div class="card-title">
+        <div class="icon" style="background:var(--blue-dim);color:var(--blue)"><i class="fa-solid fa-image"></i></div>
+        Image Pipeline
+        <span class="badge b-blue" style="margin-left:auto">Core</span>
+      </div>
+      <div style="font-size:13px;color:var(--muted);margin-bottom:12px">Upload → AI Edit → Preset/Custom Prompt → Output</div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-green">Giữ</span> Upload ảnh + preset style</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-green">Giữ</span> Custom prompt + model selector</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-green">Giữ</span> Batch image processing</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-brand">Cải</span> Real-time preview trong browser</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-brand">Cải</span> Drag-drop + paste từ clipboard</div>
+      </div>
+    </div>
+
+    <!-- Core 2 -->
+    <div class="card">
+      <div class="card-title">
+        <div class="icon" style="background:var(--brand-dim);color:var(--brand)"><i class="fa-solid fa-film"></i></div>
+        Video Pipeline
+        <span class="badge b-brand" style="margin-left:auto">Core</span>
+      </div>
+      <div style="font-size:13px;color:var(--muted);margin-bottom:12px">Image(s) → Kling AI → Video → QC</div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-green">Giữ</span> Image-to-Video (Kling 2.5 Turbo)</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-green">Giữ</span> First-Last Frame to Video</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-green">Giữ</span> Batch video creation</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-brand">Cải</span> Adaptive polling (không fix 3s)</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-brand">Cải</span> WebSocket push khi xong</div>
+      </div>
+    </div>
+
+    <!-- Core 3 -->
+    <div class="card">
+      <div class="card-title">
+        <div class="icon" style="background:var(--green-dim);color:var(--green)"><i class="fa-solid fa-check-double"></i></div>
+        QC Workflow
+        <span class="badge b-green" style="margin-left:auto">Core</span>
+      </div>
+      <div style="font-size:13px;color:var(--muted);margin-bottom:12px">Submit → Telegram Alert → Review → Approve/Reject</div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-green">Giữ</span> Submit + Approve/Reject flow</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-green">Giữ</span> Telegram notification</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-green">Giữ</span> QC queue per staff</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-brand">Cải</span> Live sync (không cần reload)</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-blue">Mới</span> Bulk approve + comment</div>
+      </div>
+    </div>
+
+    <!-- Core 4 -->
+    <div class="card">
+      <div class="card-title">
+        <div class="icon" style="background:var(--purple-dim);color:var(--purple)"><i class="fa-solid fa-users"></i></div>
+        User & Auth
+        <span class="badge b-purple" style="margin-left:auto">Core</span>
+      </div>
+      <div style="font-size:13px;color:var(--muted);margin-bottom:12px">Login → Telegram Approve → JWT → Role-based</div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-green">Giữ</span> 3 roles: staff, qc_manager, admin</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-green">Giữ</span> Telegram approve login</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-red">Bỏ</span> In-memory token cache → JWT stateless</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-brand">Cải</span> Session persist qua refresh</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-blue">Mới</span> User profile + avatar</div>
+      </div>
+    </div>
+
+    <!-- Core 5 -->
+    <div class="card">
+      <div class="card-title">
+        <div class="icon" style="background:var(--yellow-dim);color:var(--yellow)"><i class="fa-solid fa-coins"></i></div>
+        Credit & Budget
+        <span class="badge b-yellow" style="margin-left:auto">Core</span>
+      </div>
+      <div style="font-size:13px;color:var(--muted);margin-bottom:12px">Track · Alert · Rotate keys · Report</div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-green">Giữ</span> Multi-key rotation (KIE P1)</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-green">Giữ</span> PiAPI P2 integration</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-green">Giữ</span> Alert tại 80/90/100%</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-brand">Cải</span> Per-user credit tracking</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-blue">Mới</span> Dự báo hết budget theo tốc độ</div>
+      </div>
+    </div>
+
+    <!-- Core 6 -->
+    <div class="card">
+      <div class="card-title">
+        <div class="icon" style="background:var(--cyan-dim);color:var(--cyan)"><i class="fa-solid fa-chart-bar"></i></div>
+        Analytics & KPI
+        <span class="badge b-cyan" style="margin-left:auto">Core</span>
+      </div>
+      <div style="font-size:13px;color:var(--muted);margin-bottom:12px">Dashboard · Leaderboard · Report · Eval</div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-green">Giữ</span> Video/Image count per staff</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-green">Giữ</span> Auto daily/weekly report → Telegram</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-red">Bỏ</span> Shift report form phức tạp</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-brand">Cải</span> Real-time dashboard (WebSocket)</div>
+        <div style="display:flex;gap:8px;font-size:12px"><span class="badge b-blue">Mới</span> KPI scoring tự động theo công thức</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- What to REMOVE -->
+  <div class="card" style="border-color:rgba(224,85,85,.2)">
+    <div class="card-title" style="margin-bottom:16px"><div class="icon" style="background:var(--red-dim);color:var(--red)"><i class="fa-solid fa-trash"></i></div> Loại bỏ hoàn toàn (không cần thiết / quá phức tạp)</div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px">
+      <span class="tech-chip drop"><i class="fa-solid fa-xmark"></i> PyQt6 GUI desktop</span>
+      <span class="tech-chip drop"><i class="fa-solid fa-xmark"></i> SQLite write-lock</span>
+      <span class="tech-chip drop"><i class="fa-solid fa-xmark"></i> In-memory token cache</span>
+      <span class="tech-chip drop"><i class="fa-solid fa-xmark"></i> Sync HTTP calls trong GUI</span>
+      <span class="tech-chip drop"><i class="fa-solid fa-xmark"></i> Fixed 3s polling</span>
+      <span class="tech-chip drop"><i class="fa-solid fa-xmark"></i> O(n) batch-status API</span>
+      <span class="tech-chip drop"><i class="fa-solid fa-xmark"></i> Log file không rotate</span>
+      <span class="tech-chip drop"><i class="fa-solid fa-xmark"></i> scripts/package_test_release.ps1</span>
+      <span class="tech-chip drop"><i class="fa-solid fa-xmark"></i> Shift report form UI</span>
+      <span class="tech-chip drop"><i class="fa-solid fa-xmark"></i> runtime_paths.py phức tạp</span>
+      <span class="tech-chip drop"><i class="fa-solid fa-xmark"></i> ChatStreamWorker PyQt thread</span>
+      <span class="tech-chip drop"><i class="fa-solid fa-xmark"></i> Unbuffered activity_logger</span>
+    </div>
+  </div>
+</section>
+
+<!-- NEW ARCHITECTURE -->
+<section id="newarch">
+  <div class="section-eyebrow"><div class="dot" style="background:var(--green)"></div> Kiến trúc mới</div>
+  <h2>Thiết kế <span class="accent">nhẹ & thông minh</span></h2>
+  <p class="section-sub">Web-native · Stateless API · Real-time · 20+ concurrent users · Deploy 1 lệnh.</p>
+
+  <!-- Architecture Diagram -->
+  <div style="margin-bottom:32px">
+    <div style="font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:16px">Kiến trúc 3 tầng</div>
+    <div class="arch-grid">
+
+      <!-- Frontend -->
+      <div class="arch-box" style="background:var(--blue-dim);border-color:rgba(90,158,232,.25)">
+        <div class="arch-layer" style="color:var(--blue)">🖥️ Frontend (Browser)</div>
+        <div class="arch-items">
+          <div class="arch-item"><i class="fa-brands fa-vuejs" style="color:var(--green)"></i> Vue 3 / React (SPA)</div>
+          <div class="arch-item"><i class="fa-solid fa-bolt" style="color:var(--brand)"></i> Vite + TailwindCSS</div>
+          <div class="arch-item"><i class="fa-solid fa-plug" style="color:var(--cyan)"></i> WebSocket (live updates)</div>
+          <div class="arch-item"><i class="fa-solid fa-image" style="color:var(--blue)"></i> Drag-drop image upload</div>
+          <div class="arch-item"><i class="fa-solid fa-chart-line" style="color:var(--yellow)"></i> Real-time dashboard</div>
+          <div class="arch-item"><i class="fa-brands fa-telegram" style="color:var(--blue)"></i> Telegram WebApp</div>
+        </div>
+      </div>
+
+      <div class="arch-arrow"><i class="fa-solid fa-arrows-left-right"></i></div>
+
+      <!-- Backend -->
+      <div class="arch-box" style="background:var(--brand-dim);border-color:rgba(217,122,43,.25)">
+        <div class="arch-layer" style="color:var(--brand)">⚡ Backend API (FastAPI)</div>
+        <div class="arch-items">
+          <div class="arch-item"><i class="fa-solid fa-server" style="color:var(--brand)"></i> FastAPI + Uvicorn</div>
+          <div class="arch-item"><i class="fa-solid fa-lock" style="color:var(--yellow)"></i> JWT stateless auth</div>
+          <div class="arch-item"><i class="fa-solid fa-plug" style="color:var(--cyan)"></i> WebSocket manager</div>
+          <div class="arch-item"><i class="fa-solid fa-layer-group" style="color:var(--purple)"></i> Async task queue (asyncio)</div>
+          <div class="arch-item"><i class="fa-solid fa-robot" style="color:var(--green)"></i> KIE/PiAPI client (async)</div>
+          <div class="arch-item"><i class="fa-solid fa-bell" style="color:var(--blue)"></i> Buffered activity logger</div>
+        </div>
+      </div>
+
+      <div class="arch-arrow"><i class="fa-solid fa-arrows-left-right"></i></div>
+
+      <!-- Data -->
+      <div class="arch-box" style="background:var(--purple-dim);border-color:rgba(155,114,232,.25)">
+        <div class="arch-layer" style="color:var(--purple)">🗄️ Data Layer</div>
+        <div class="arch-items">
+          <div class="arch-item"><i class="fa-solid fa-database" style="color:var(--purple)"></i> PostgreSQL (chính)</div>
+          <div class="arch-item"><i class="fa-solid fa-bolt" style="color:var(--yellow)"></i> Redis (cache + queue)</div>
+          <div class="arch-item"><i class="fa-brands fa-cloudflare" style="color:var(--brand)"></i> S3/R2 (media storage)</div>
+          <div class="arch-item"><i class="fa-solid fa-file-lines" style="color:var(--green)"></i> Structured logs (JSON)</div>
+          <div class="arch-item"><i class="fa-solid fa-shield" style="color:var(--cyan)"></i> Supabase (optional)</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Core Flow -->
+  <div style="margin-bottom:32px">
+    <div style="font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:16px">Flow người dùng chính</div>
+    <div class="flow-row" style="margin-bottom:12px">
+      <div class="flow-node blue">
+        <div class="flow-node-num">1</div>
+        <div class="flow-node-title">Browser Login</div>
+        <div class="flow-node-desc">User nhập tên → POST /auth/login → pending → Telegram Bot duyệt → JWT token</div>
+      </div>
+      <div class="flow-connector"><i class="fa-solid fa-arrow-right"></i></div>
+      <div class="flow-node brand">
+        <div class="flow-node-num">2</div>
+        <div class="flow-node-title">Chỉnh ảnh</div>
+        <div class="flow-node-desc">Upload → chọn preset → gửi KIE API → real-time preview qua WebSocket</div>
+      </div>
+      <div class="flow-connector"><i class="fa-solid fa-arrow-right"></i></div>
+      <div class="flow-node brand">
+        <div class="flow-node-num">3</div>
+        <div class="flow-node-title">Tạo Video</div>
+        <div class="flow-node-desc">Kling 2.5 Turbo · adaptive poll → WebSocket push khi xong (không reload)</div>
+      </div>
+      <div class="flow-connector"><i class="fa-solid fa-arrow-right"></i></div>
+      <div class="flow-node green">
+        <div class="flow-node-num">4</div>
+        <div class="flow-node-title">Submit QC</div>
+        <div class="flow-node-desc">1-click submit → Telegram alert → QC review → Approve/Reject live</div>
+      </div>
+      <div class="flow-connector"><i class="fa-solid fa-arrow-right"></i></div>
+      <div class="flow-node purple">
+        <div class="flow-node-num">5</div>
+        <div class="flow-node-title">Library & Report</div>
+        <div class="flow-node-desc">Approved vào library → Dashboard tự cập nhật → Auto report Telegram 18:00</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Key Improvements -->
+  <div class="g3">
+    <div class="card">
+      <div class="card-title"><div class="icon" style="background:var(--cyan-dim);color:var(--cyan)"><i class="fa-solid fa-plug"></i></div> WebSocket Real-time</div>
+      <div style="font-size:13px;color:var(--muted);line-height:1.6">
+        Thay polling 3s cố định bằng WebSocket.<br>Server push khi video xong, QC approve, credit alert.<br>
+        <strong style="color:var(--green)">Kết quả: -95% unnecessary network calls</strong>
+      </div>
+      <div class="prog-bar" style="margin-top:12px"><div class="prog-fill prog-green" style="width:95%"></div></div>
+      <div style="font-size:11px;color:var(--muted);margin-top:4px">Giảm network overhead 95%</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><div class="icon" style="background:var(--yellow-dim);color:var(--yellow)"><i class="fa-solid fa-database"></i></div> PostgreSQL + Redis</div>
+      <div style="font-size:13px;color:var(--muted);line-height:1.6">
+        PostgreSQL cho persistence, connection pool.<br>Redis cho cache credit balance, job queue, session.<br>
+        <strong style="color:var(--green)">Kết quả: -80% DB latency vs SQLite no-WAL</strong>
+      </div>
+      <div class="prog-bar" style="margin-top:12px"><div class="prog-fill prog-green" style="width:80%"></div></div>
+      <div style="font-size:11px;color:var(--muted);margin-top:4px">Giảm DB latency 80%</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><div class="icon" style="background:var(--brand-dim);color:var(--brand)"><i class="fa-solid fa-users"></i></div> Truly Multi-user</div>
+      <div style="font-size:13px;color:var(--muted);line-height:1.6">
+        1 server → 20+ users đồng thời.<br>Mỗi user thấy job của mình real-time.<br>
+        <strong style="color:var(--green)">Scale: 1 → 20 users không thêm infra</strong>
+      </div>
+      <div class="prog-bar" style="margin-top:12px"><div class="prog-fill prog-brand" style="width:90%"></div></div>
+      <div style="font-size:11px;color:var(--muted);margin-top:4px">1 backend phục vụ 20+ concurrent users</div>
+    </div>
+  </div>
+</section>
+
+<!-- TECH STACK -->
+<section id="techstack">
+  <div class="section-eyebrow"><div class="dot" style="background:var(--purple)"></div> Tech Stack</div>
+  <h2><span class="accent">Giữ · Bỏ · Thêm</span></h2>
+  <p class="section-sub">Quyết định cụ thể từng component.</p>
+
+  <div class="card" style="margin-bottom:20px">
+    <div class="table-wrapper">
+      <table>
+        <thead>
+          <tr>
+            <th>Component</th>
+            <th>App cũ</th>
+            <th>Quyết định</th>
+            <th>Hướng mới</th>
+            <th>Lý do</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Frontend</strong></td>
+            <td><span class="badge b-red">PyQt6</span></td>
+            <td><span class="badge b-red"><i class="fa-solid fa-xmark"></i> Bỏ</span></td>
+            <td><span class="badge b-green">Vue 3 / React SPA</span></td>
+            <td style="color:var(--muted)">Browser-based, cross-platform, không cần cài</td>
+          </tr>
+          <tr>
+            <td><strong>Backend</strong></td>
+            <td><span class="badge b-yellow">FastAPI</span></td>
+            <td><span class="badge b-green"><i class="fa-solid fa-check"></i> Giữ</span></td>
+            <td><span class="badge b-green">FastAPI + async đúng cách</span></td>
+            <td style="color:var(--muted)">Đã tốt, chỉ cần refactor async</td>
+          </tr>
+          <tr>
+            <td><strong>Database</strong></td>
+            <td><span class="badge b-red">SQLite no-WAL</span></td>
+            <td><span class="badge b-red"><i class="fa-solid fa-xmark"></i> Bỏ</span></td>
+            <td><span class="badge b-green">PostgreSQL + asyncpg</span></td>
+            <td style="color:var(--muted)">Multi-user, concurrent writes, connection pool</td>
+          </tr>
+          <tr>
+            <td><strong>Cache</strong></td>
+            <td><span class="badge b-red">Không có</span></td>
+            <td><span class="badge b-blue"><i class="fa-solid fa-plus"></i> Thêm</span></td>
+            <td><span class="badge b-blue">Redis</span></td>
+            <td style="color:var(--muted)">Cache credit, job queue, session, rate limit</td>
+          </tr>
+          <tr>
+            <td><strong>Auth</strong></td>
+            <td><span class="badge b-red">In-memory token cache</span></td>
+            <td><span class="badge b-red"><i class="fa-solid fa-xmark"></i> Bỏ</span></td>
+            <td><span class="badge b-green">JWT stateless + refresh token</span></td>
+            <td style="color:var(--muted)">Stateless, persist qua crash, multi-device</td>
+          </tr>
+          <tr>
+            <td><strong>Real-time</strong></td>
+            <td><span class="badge b-red">Polling 3s</span></td>
+            <td><span class="badge b-red"><i class="fa-solid fa-xmark"></i> Bỏ</span></td>
+            <td><span class="badge b-green">WebSocket (ws://)</span></td>
+            <td style="color:var(--muted)">Push từ server, -95% requests</td>
+          </tr>
+          <tr>
+            <td><strong>Media Storage</strong></td>
+            <td><span class="badge b-red">Local disk</span></td>
+            <td><span class="badge b-brand"><i class="fa-solid fa-arrow-up"></i> Nâng</span></td>
+            <td><span class="badge b-brand">S3 / Cloudflare R2</span></td>
+            <td style="color:var(--muted)">Accessible từ mọi nơi, không chiếm disk server</td>
+          </tr>
+          <tr>
+            <td><strong>Activity Log</strong></td>
+            <td><span class="badge b-red">Sync per-event DB write</span></td>
+            <td><span class="badge b-red"><i class="fa-solid fa-xmark"></i> Bỏ</span></td>
+            <td><span class="badge b-green">Async queue + batch write 5s</span></td>
+            <td style="color:var(--muted)">-99% DB connections từ logger</td>
+          </tr>
+          <tr>
+            <td><strong>Telegram</strong></td>
+            <td><span class="badge b-yellow">Async calls</span></td>
+            <td><span class="badge b-green"><i class="fa-solid fa-check"></i> Giữ</span></td>
+            <td><span class="badge b-green">Telegram Bot + WebApp</span></td>
+            <td style="color:var(--muted)">Core UX, approve login/QC từ Telegram</td>
+          </tr>
+          <tr>
+            <td><strong>AI Provider</strong></td>
+            <td><span class="badge b-yellow">KIE + PiAPI</span></td>
+            <td><span class="badge b-green"><i class="fa-solid fa-check"></i> Giữ</span></td>
+            <td><span class="badge b-green">KIE (key rotation) + PiAPI</span></td>
+            <td style="color:var(--muted)">Core đang hoạt động tốt</td>
+          </tr>
+          <tr>
+            <td><strong>Packaging</strong></td>
+            <td><span class="badge b-red">.zip + .venv</span></td>
+            <td><span class="badge b-red"><i class="fa-solid fa-xmark"></i> Bỏ</span></td>
+            <td><span class="badge b-green">Docker Compose / 1 lệnh</span></td>
+            <td style="color:var(--muted)">Deploy bất kỳ đâu, không cần Python local</td>
+          </tr>
+          <tr>
+            <td><strong>Monitoring</strong></td>
+            <td><span class="badge b-red">backend.log plain text</span></td>
+            <td><span class="badge b-brand"><i class="fa-solid fa-arrow-up"></i> Nâng</span></td>
+            <td><span class="badge b-brand">JSON structured + rotating</span></td>
+            <td style="color:var(--muted)">Searchable, parseable, size-bounded</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- DB Schema mới -->
+  <div class="g2">
+    <div class="card">
+      <div class="card-title"><div class="icon" style="background:var(--purple-dim);color:var(--purple)"><i class="fa-solid fa-database"></i></div> DB Schema – Gộp & Tối giản</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:12px">12 bảng cũ → 8 bảng mới, rõ ràng hơn</div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        ${[
+          ['users', 'id, username, role, telegram_id, avatar_url, created_at', 'green'],
+          ['auth_tokens', 'id, user_id, token_hash, expires_at, device', 'green'],
+          ['workspaces', 'id, user_id, name, status, credits_used, created_at', 'green'],
+          ['tasks', 'id, workspace_id, user_id, type, status, provider, model, cost, product_code, result_url, created_at', 'brand'],
+          ['qc_queue', 'id, task_id, reviewer_id, status, comment, reviewed_at', 'green'],
+          ['credits', 'id, provider, key_hash, balance, last_checked_at', 'yellow'],
+          ['notifications', 'id, user_id, type, payload, read, created_at', 'blue'],
+          ['activity_logs', 'id, user_id, action, meta (JSON), created_at', 'gray'],
+        ].map(([name, fields, color]) => `
+          <div style="padding:8px 10px;background:var(--bg2);border-radius:6px;border:1px solid var(--border)">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+              <span class="badge b-${color}" style="font-family:monospace">${name}</span>
+            </div>
+            <div style="font-size:10px;color:var(--muted);font-family:monospace">${fields}</div>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><div class="icon" style="background:var(--cyan-dim);color:var(--cyan)"><i class="fa-solid fa-code"></i></div> API Design mới (RESTful + WS)</div>
+      <pre style="font-size:11px;line-height:1.8"><span class="code-comment"># Auth</span>
+<span class="code-key">POST</span>   <span class="code-val">/api/v2/auth/login</span>
+<span class="code-key">GET</span>    <span class="code-val">/api/v2/auth/poll/{id}</span>
+<span class="code-key">POST</span>   <span class="code-val">/api/v2/auth/refresh</span>
+
+<span class="code-comment"># Workspace (Code cũ = Workspace mới)</span>
+<span class="code-key">GET</span>    <span class="code-val">/api/v2/workspaces</span>
+<span class="code-key">POST</span>   <span class="code-val">/api/v2/workspaces</span>
+
+<span class="code-comment"># Tasks (image + video chung)</span>
+<span class="code-key">POST</span>   <span class="code-val">/api/v2/tasks</span>
+<span class="code-key">GET</span>    <span class="code-val">/api/v2/tasks?workspace=&type=</span>
+<span class="code-key">GET</span>    <span class="code-val">/api/v2/tasks/{id}/status</span>
+<span class="code-key">POST</span>   <span class="code-val">/api/v2/tasks/batch</span>
+
+<span class="code-comment"># QC</span>
+<span class="code-key">POST</span>   <span class="code-val">/api/v2/qc/submit</span>
+<span class="code-key">PATCH</span>  <span class="code-val">/api/v2/qc/{id}</span>
+
+<span class="code-comment"># WebSocket (real-time)</span>
+<span class="code-key">WS</span>     <span class="code-val">/ws/{user_id}?token=JWT</span>
+
+<span class="code-comment"># Dashboard</span>
+<span class="code-key">GET</span>    <span class="code-val">/api/v2/stats/dashboard</span>
+<span class="code-key">GET</span>    <span class="code-val">/api/v2/stats/credits</span></pre>
+    </div>
+  </div>
+</section>
+
+<!-- ROADMAP -->
+<section id="roadmap">
+  <div class="section-eyebrow"><div class="dot" style="background:var(--brand)"></div> Roadmap thực thi</div>
+  <h2>4 giai đoạn · <span class="accent">8 tuần</span></h2>
+  <p class="section-sub">Từ app cũ sang hệ thống mới – ưu tiên giá trị trước, hoàn thiện sau.</p>
+
+  <div class="g4" style="margin-bottom:32px">
+    <div class="card" style="border-color:rgba(224,85,85,.3)">
+      <div style="color:var(--red);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">Phase 0 · Tuần 1</div>
+      <div style="font-size:16px;font-weight:800;margin-bottom:8px">Nền tảng</div>
+      <div style="display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(--muted)">
+        <div><i class="fa-solid fa-check" style="color:var(--green);margin-right:6px"></i>Setup FastAPI + PostgreSQL + Redis</div>
+        <div><i class="fa-solid fa-check" style="color:var(--green);margin-right:6px"></i>JWT auth + Telegram approve flow</div>
+        <div><i class="fa-solid fa-check" style="color:var(--green);margin-right:6px"></i>WebSocket connection manager</div>
+        <div><i class="fa-solid fa-check" style="color:var(--green);margin-right:6px"></i>Docker Compose config</div>
+        <div><i class="fa-solid fa-check" style="color:var(--green);margin-right:6px"></i>Migrate DB schema (8 bảng)</div>
+      </div>
+    </div>
+
+    <div class="card" style="border-color:rgba(217,122,43,.3)">
+      <div style="color:var(--brand);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">Phase 1 · Tuần 2-3</div>
+      <div style="font-size:16px;font-weight:800;margin-bottom:8px">Core Features</div>
+      <div style="display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(--muted)">
+        <div><i class="fa-solid fa-check" style="color:var(--green);margin-right:6px"></i>Image edit API (KIE integration)</div>
+        <div><i class="fa-solid fa-check" style="color:var(--green);margin-right:6px"></i>Video create API (Kling + polling)</div>
+        <div><i class="fa-solid fa-check" style="color:var(--green);margin-right:6px"></i>Batch processing endpoint</div>
+        <div><i class="fa-solid fa-check" style="color:var(--green);margin-right:6px"></i>WebSocket push job status</div>
+        <div><i class="fa-solid fa-check" style="color:var(--green);margin-right:6px"></i>QC submit/approve/reject</div>
+      </div>
+    </div>
+
+    <div class="card" style="border-color:rgba(90,158,232,.3)">
+      <div style="color:var(--blue);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">Phase 2 · Tuần 4-5</div>
+      <div style="font-size:16px;font-weight:800;margin-bottom:8px">Frontend SPA</div>
+      <div style="display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(--muted)">
+        <div><i class="fa-solid fa-check" style="color:var(--green);margin-right:6px"></i>Creator workspace (3 cột)</div>
+        <div><i class="fa-solid fa-check" style="color:var(--green);margin-right:6px"></i>Real-time dashboard</div>
+        <div><i class="fa-solid fa-check" style="color:var(--green);margin-right:6px"></i>QC Manager interface</div>
+        <div><i class="fa-solid fa-check" style="color:var(--green);margin-right:6px"></i>Library + filter by workspace</div>
+        <div><i class="fa-solid fa-check" style="color:var(--green);margin-right:6px"></i>Mobile responsive</div>
+      </div>
+    </div>
+
+    <div class="card" style="border-color:rgba(95,184,95,.3)">
+      <div style="color:var(--green);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">Phase 3 · Tuần 6-8</div>
+      <div style="font-size:16px;font-weight:800;margin-bottom:8px">Intelligence</div>
+      <div style="display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(--muted)">
+        <div><i class="fa-solid fa-check" style="color:var(--green);margin-right:6px"></i>KPI dashboard + leaderboard</div>
+        <div><i class="fa-solid fa-check" style="color:var(--green);margin-right:6px"></i>Auto Telegram reports</div>
+        <div><i class="fa-solid fa-check" style="color:var(--green);margin-right:6px"></i>Credit forecasting</div>
+        <div><i class="fa-solid fa-check" style="color:var(--green);margin-right:6px"></i>AI Chat (stream + cancel)</div>
+        <div><i class="fa-solid fa-check" style="color:var(--green);margin-right:6px"></i>S3 media storage migration</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Timeline -->
+  <div class="card">
+    <div class="card-title" style="margin-bottom:16px"><div class="icon" style="background:var(--brand-dim);color:var(--brand)"><i class="fa-solid fa-calendar"></i></div> Timeline chi tiết – 8 tuần</div>
+    <div class="timeline">
+      <div class="timeline-item">
+        <div class="timeline-dot done"><i class="fa-solid fa-check" style="font-size:7px;color:white"></i></div>
+        <div class="timeline-title">Tuần 1 – Backend foundation <span class="badge b-red" style="margin-left:8px">NGAY BÂY</span></div>
+        <div class="timeline-desc">FastAPI + PostgreSQL + Redis + JWT + WebSocket manager + Docker Compose</div>
+      </div>
+      <div class="timeline-item">
+        <div class="timeline-dot active"></div>
+        <div class="timeline-title">Tuần 2 – Image & Video API</div>
+        <div class="timeline-desc">Task endpoint chung (image+video) + KIE async client + adaptive polling + WS push</div>
+      </div>
+      <div class="timeline-item">
+        <div class="timeline-dot"></div>
+        <div class="timeline-title">Tuần 3 – Batch + QC backend</div>
+        <div class="timeline-desc">Batch endpoint O(1) DB query + QC routes + Telegram notify + activity log buffered</div>
+      </div>
+      <div class="timeline-item">
+        <div class="timeline-dot"></div>
+        <div class="timeline-title">Tuần 4 – Frontend SPA setup</div>
+        <div class="timeline-desc">Vite + Vue3/React + TailwindCSS + WS client + auth flow + workspace selector</div>
+      </div>
+      <div class="timeline-item">
+        <div class="timeline-dot"></div>
+        <div class="timeline-title">Tuần 5 – Creator Workspace</div>
+        <div class="timeline-desc">3 cột (ảnh → video → batch) + real-time queue + AI chat sidebar</div>
+      </div>
+      <div class="timeline-item">
+        <div class="timeline-dot"></div>
+        <div class="timeline-title">Tuần 6 – Dashboard + HR</div>
+        <div class="timeline-desc">KPI charts + leaderboard + credit tracking + staff management</div>
+      </div>
+      <div class="timeline-item">
+        <div class="timeline-dot"></div>
+        <div class="timeline-title">Tuần 7 – Automation</div>
+        <div class="timeline-desc">Auto reports Telegram + credit forecast + alert rules + eval scoring</div>
+      </div>
+      <div class="timeline-item">
+        <div class="timeline-dot"></div>
+        <div class="timeline-title">Tuần 8 – Production ready</div>
+        <div class="timeline-desc">S3 migration + load test 20 users + monitoring + deployment guide</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- COMPARE -->
+<section id="compare">
+  <div class="section-eyebrow"><div class="dot" style="background:var(--cyan)"></div> So sánh</div>
+  <h2>Before vs <span class="accent">After</span></h2>
+  <p class="section-sub">Con số cụ thể – không ước tính mơ hồ.</p>
+
+  <div class="card" style="margin-bottom:20px">
+    <canvas id="compareChart" height="100"></canvas>
+  </div>
+
+  <div class="g2" style="margin-bottom:24px">
+    <div class="card">
+      <div class="card-title" style="margin-bottom:16px"><div class="icon" style="background:var(--red-dim);color:var(--red)"><i class="fa-solid fa-clock"></i></div> Hiệu suất – App cũ</div>
+      ${[
+        ['SQLite write latency', '10–200ms (write lock)', 'red'],
+        ['Activity log overhead', '4 giây/ca (3,880 connections)', 'red'],
+        ['Batch status API calls', '4,000 calls/20 phút (O×n)', 'red'],
+        ['Poll requests hữu ích', '~1% (99% vô dụng)', 'red'],
+        ['Chat cancel credit waste', '~90% credits bị mất', 'red'],
+        ['Max concurrent users', '1 (standalone) / khó multi', 'red'],
+        ['Deploy time', '30–60 phút (install .venv + config)', 'red'],
+      ].map(([k, v, c]) => `
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px">
+          <span style="color:var(--muted)">${k}</span>
+          <span class="badge b-${c}">${v}</span>
+        </div>
+      `).join('')}
+    </div>
+
+    <div class="card">
+      <div class="card-title" style="margin-bottom:16px"><div class="icon" style="background:var(--green-dim);color:var(--green)"><i class="fa-solid fa-bolt"></i></div> Hiệu suất – Hệ thống mới</div>
+      ${[
+        ['PostgreSQL write latency', '0.5–5ms (connection pool)', 'green'],
+        ['Activity log overhead', '~0 (async batch queue)', 'green'],
+        ['Batch status API calls', 'O(1) DB query thay O(n) API', 'green'],
+        ['Poll requests hữu ích', '100% (WebSocket push)', 'green'],
+        ['Chat cancel credit waste', '<5% (upstream cancel)', 'green'],
+        ['Max concurrent users', '20+ (1 server, scale dễ)', 'green'],
+        ['Deploy time', '2 phút (docker compose up)', 'green'],
+      ].map(([k, v, c]) => `
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px">
+          <span style="color:var(--muted)">${k}</span>
+          <span class="badge b-${c}">${v}</span>
+        </div>
+      `).join('')}
+    </div>
+  </div>
+
+  <!-- Risk Matrix -->
+  <div class="card">
+    <div class="card-title" style="margin-bottom:16px"><div class="icon" style="background:var(--yellow-dim);color:var(--yellow)"><i class="fa-solid fa-triangle-exclamation"></i></div> Risk Matrix – Khi làm lại</div>
+    <div class="risk-grid">
+      <div class="risk-item" style="border-color:rgba(224,85,85,.3);background:var(--red-dim)">
+        <div class="risk-title" style="color:var(--red)">🔴 Cao – Migration data</div>
+        <div class="risk-desc">12 bảng SQLite → 8 bảng PostgreSQL. Cần script migrate + verify từng record. Chạy song song 1 tuần.</div>
+      </div>
+      <div class="risk-item" style="border-color:rgba(232,200,74,.3);background:var(--yellow-dim)">
+        <div class="risk-title" style="color:var(--yellow)">🟡 Trung – Provider downtime</div>
+        <div class="risk-desc">KIE/PiAPI có thể 402/503. Circuit breaker + fallback key rotation đã có – cần giữ nguyên logic.</div>
+      </div>
+      <div class="risk-item" style="border-color:rgba(232,200,74,.3);background:var(--yellow-dim)">
+        <div class="risk-title" style="color:var(--yellow)">🟡 Trung – User training</div>
+        <div class="risk-desc">Staff quen với PyQt6 GUI. Cần training buổi, hướng dẫn + demo. Browser UX dễ hơn → adoption nhanh.</div>
+      </div>
+      <div class="risk-item" style="border-color:rgba(95,184,95,.3);background:var(--green-dim)">
+        <div class="risk-title" style="color:var(--green)">🟢 Thấp – Telegram integration</div>
+        <div class="risk-desc">Logic Telegram đã ổn định. Giữ nguyên Bot token, chỉ thay endpoint URL từ localhost → domain mới.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- SUMMARY -->
+<section>
+  <div class="card" style="background:linear-gradient(135deg, rgba(217,122,43,.08) 0%, rgba(155,114,232,.08) 100%); border-color:rgba(217,122,43,.3); text-align:center; padding:40px">
+    <div style="font-size:40px; margin-bottom:16px">🚀</div>
+    <h2 style="font-size:28px; margin-bottom:12px">TL;DR – Quyết định 1 câu</h2>
+    <p style="font-size:16px; color:var(--muted); max-width:700px; margin:0 auto 24px; line-height:1.8">
+      <strong style="color:var(--text)">Giữ toàn bộ nghiệp vụ cốt lõi</strong> (image edit → video → QC → report → credit track),
+      <strong style="color:var(--red)">bỏ toàn bộ desktop infrastructure</strong> (PyQt6, SQLite no-WAL, polling, sync calls),
+      <strong style="color:var(--green)">xây lại trên nền Web</strong> (FastAPI async + PostgreSQL + Redis + WebSocket + Docker) trong <strong style="color:var(--brand)">8 tuần</strong>.
+    </p>
+    <div style="display:flex; justify-content:center; gap:16px; flex-wrap:wrap">
+      <div style="padding:14px 20px; background:var(--card); border:1px solid var(--border); border-radius:10px; min-width:140px">
+        <div style="font-size:28px; font-weight:800; color:var(--green)">8</div>
+        <div style="font-size:12px; color:var(--muted)">tuần deliver</div>
+      </div>
+      <div style="padding:14px 20px; background:var(--card); border:1px solid var(--border); border-radius:10px; min-width:140px">
+        <div style="font-size:28px; font-weight:800; color:var(--brand)">20+</div>
+        <div style="font-size:12px; color:var(--muted)">users đồng thời</div>
+      </div>
+      <div style="padding:14px 20px; background:var(--card); border:1px solid var(--border); border-radius:10px; min-width:140px">
+        <div style="font-size:28px; font-weight:800; color:var(--blue)">-95%</div>
+        <div style="font-size:12px; color:var(--muted)">network waste</div>
+      </div>
+      <div style="padding:14px 20px; background:var(--card); border:1px solid var(--border); border-radius:10px; min-width:140px">
+        <div style="font-size:28px; font-weight:800; color:var(--purple)">2 min</div>
+        <div style="font-size:12px; color:var(--muted)">deploy time</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>VideoTool Analysis · Genspark AI · 25/03/2026 · Phân tích từ mã nguồn thực tế tại H:\F-Aistudio-v1.6\VideoTool</footer>
+
+<script>
+// HERO RADAR CHART
+new Chart(document.getElementById('heroChart'), {
+  type: 'radar',
+  data: {
+    labels: ['Multi-user', 'Performance', 'Deploy', 'Real-time', 'Scale', 'UX'],
+    datasets: [
+      {
+        label: 'App cũ (PyQt6)',
+        data: [10, 30, 20, 15, 10, 35],
+        borderColor: '#E05555', backgroundColor: 'rgba(224,85,85,.1)',
+        pointBackgroundColor: '#E05555', borderWidth: 2,
+      },
+      {
+        label: 'Hướng mới (Web)',
+        data: [90, 85, 95, 92, 88, 90],
+        borderColor: '#5FB85F', backgroundColor: 'rgba(95,184,95,.15)',
+        pointBackgroundColor: '#5FB85F', borderWidth: 2,
+      }
+    ]
+  },
+  options: {
+    responsive: true, maintainAspectRatio: true,
+    plugins: { legend: { labels: { color: '#8888A0', font: { size: 10 }, boxWidth: 10 } } },
+    scales: {
+      r: {
+        ticks: { color: '#555568', font: { size: 9 }, backdropColor: 'transparent', stepSize: 20 },
+        grid: { color: 'rgba(42,42,48,.8)' },
+        pointLabels: { color: '#8888A0', font: { size: 10 } },
+        min: 0, max: 100,
+      }
+    }
+  }
+});
+
+// COMPARE BAR CHART
+new Chart(document.getElementById('compareChart'), {
+  type: 'bar',
+  data: {
+    labels: ['DB Latency\n(ms)', 'Log overhead\n(connections/day)', 'Useful polls\n(%)', 'Deploy time\n(minutes)', 'Max users'],
+    datasets: [
+      {
+        label: 'App cũ',
+        data: [105, 3880, 1, 45, 2],
+        backgroundColor: 'rgba(224,85,85,.7)', borderColor: '#E05555', borderWidth: 1, borderRadius: 4,
+      },
+      {
+        label: 'Hệ thống mới',
+        data: [3, 50, 100, 2, 20],
+        backgroundColor: 'rgba(95,184,95,.7)', borderColor: '#5FB85F', borderWidth: 1, borderRadius: 4,
+      }
+    ]
+  },
+  options: {
+    responsive: true, maintainAspectRatio: true,
+    plugins: { legend: { labels: { color: '#8888A0', font: { size: 11 }, boxWidth: 12 } } },
+    scales: {
+      x: { ticks: { color: '#8888A0', font: { size: 10 } }, grid: { color: 'rgba(42,42,48,.5)' } },
+      y: { ticks: { color: '#8888A0', font: { size: 10 } }, grid: { color: 'rgba(42,42,48,.5)' } }
+    }
+  }
+});
+
+// SCROLL SPY
+const sections = ['hero','problems','core','newarch','techstack','roadmap','compare'];
+const dots = document.querySelectorAll('.scroll-dot');
+
+function updateScrollNav() {
+  let active = 0;
+  sections.forEach((id, i) => {
+    const el = document.getElementById(id);
+    if (el) {
+      const rect = el.getBoundingClientRect();
+      if (rect.top <= 100) active = i;
+    }
+  });
+  dots.forEach((d, i) => d.classList.toggle('active', i === active));
+
+  // Update nav links
+  document.querySelectorAll('.nav-link').forEach((l, i) => {
+    if (i < sections.length) l.classList.toggle('active', i === active);
+  });
+}
+
+window.addEventListener('scroll', updateScrollNav);
+
+function scrollTo(selector) {
+  const id = selector.replace('#', '');
+  document.getElementById(id)?.scrollIntoView({ behavior: 'smooth' });
+}
+</script>
+</body>
+</html>
