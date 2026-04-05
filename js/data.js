@@ -24,6 +24,8 @@ const AppData = {
 
   // ---- LIBRARY / OUTPUT (tagged) ----
   library: [],
+  qcQueue: [],
+  systemStatus: { online_staff: [], online_count: 0, pending_video: 0, pending_image: 0, announcements: [] },
 
   // ---- SESSIONS ----
   sessions: [],
@@ -81,6 +83,7 @@ if (!AppData.seedEnabled) {
   AppData.staff = [];
   AppData.images = [];
   AppData.library = [];
+  AppData.qcQueue = [];
   AppData.sessions = [];
   AppData.creditLog = [];
   AppData.shiftReports = [];
@@ -193,7 +196,9 @@ function getPeriodStats(mode = 'all') {
 
 // Get QC queue (items pending QC)
 function getQCQueue() {
-  return AppData.library.filter(i => i.status === 'pending_qc');
+  return (Array.isArray(AppData.qcQueue) ? AppData.qcQueue : [])
+    .filter((item) => String(item.status || '').trim().toLowerCase() === 'pending')
+    .sort((a, b) => Number(a.submittedAt || 0) - Number(b.submittedAt || 0));
 }
 
 // Get active sessions count
@@ -288,12 +293,14 @@ function filterLibraryItems(filters = {}) {
   const code = String(filters.code || '').trim().toLowerCase();
   const type = String(filters.type || '').trim().toLowerCase();
   const status = String(filters.status || '').trim().toLowerCase();
+  const effect = String(filters.effect || '').trim().toLowerCase();
   const viewUserId = getViewUserId();
   return (Array.isArray(AppData.library) ? AppData.library : []).filter((item) => {
     if (viewUserId && !isSameStaffRef(item.staffId, viewUserId)) return false;
     if (code && String(item.codeTag || '').trim().toLowerCase() !== code) return false;
     if (type && String(item.type || item.mediaType || '').trim().toLowerCase() !== type) return false;
     if (status && String(item.status || '').trim().toLowerCase() !== status) return false;
+    if (effect && String(item.effectGroup || item.effect_group || '').trim().toLowerCase() !== effect) return false;
     return true;
   });
 }
@@ -335,10 +342,29 @@ function filterStaffKPI(filters = {}) {
 
 function filterQCQueue(filters = {}) {
   const staffId = String(filters.staffId || '').trim();
+  const date = String(filters.date || '').trim();
+  const effect = String(filters.effect || '').trim().toLowerCase();
+  const assigned = String(filters.assigned || '').trim();
+  const status = String(filters.status || '').trim().toLowerCase();
   const viewUserId = getViewUserId();
   return getQCQueue().filter((item) => {
     if (viewUserId && !isSameStaffRef(item.staffId, viewUserId)) return false;
     if (staffId && !isSameStaffRef(item.staffId, staffId)) return false;
+    if (date) {
+      const submittedAt = Number(item.submittedAt || 0);
+      if (!submittedAt) return false;
+      const itemDate = new Date(submittedAt * 1000).toISOString().slice(0, 10);
+      if (itemDate !== date) return false;
+    }
+    if (effect) {
+      const effectValue = String(item.effectGroup || '').trim().toLowerCase();
+      if (effectValue !== effect) return false;
+    }
+    if (assigned) {
+      if (assigned === '__free__' && String(item.assignedQcUser || '').trim()) return false;
+      if (assigned !== '__free__' && String(item.assignedQcUser || '').trim() !== assigned) return false;
+    }
+    if (status && String(item.status || '').trim().toLowerCase() !== status) return false;
     return true;
   });
 }
@@ -423,7 +449,11 @@ function parseShiftDescription(description) {
 }
 
 function getViewUserId() {
-  return getScopeUsername();
+  const authRole = String(AppData.authSession?.role || AppData.authUser?.role || AppData.currentUser?.role || '').trim().toLowerCase();
+  const mode = String(AppData.viewContext?.mode || '').trim().toLowerCase();
+  if (mode === 'impersonate') return getScopeUsername();
+  if (authRole === 'staff') return getScopeUsername();
+  return '';
 }
 
 function isViewingAsAnotherUser() {

@@ -5,9 +5,17 @@ let notifOpen = false;
 let codeCount = 3;
 let currentHRTab = 'staff';
 let _pendingPollTimer = null;
+let _registerPendingPollTimer = null;
+let _recoverPendingPollTimer = null;
 let _bgPollTimer = null;
 let _activeShiftTimer = null;
 let _lastRecoverStuckAt = 0;
+let _lastSystemStatusSignature = '';
+let _lastSessionCollectionSignature = '';
+const REGISTER_PENDING_STORAGE_KEY = 'registerPendingRequestId';
+const REGISTER_PENDING_CREDENTIALS_KEY = 'registerPendingCredentials';
+const RECOVER_PENDING_STORAGE_KEY = 'recoverPendingRequestId';
+const RECOVER_PENDING_CREDENTIALS_KEY = 'recoverPendingCredentials';
 
 // Role configs mapped from AppData.staff
 function getRoleConfig(role) {
@@ -25,7 +33,7 @@ function getAuthRole() {
 }
 
 function canUseRoleSwitcher() {
-  return ['admin', 'qc_manager'].includes(getAuthRole());
+  return getAuthRole() === 'admin';
 }
 
 function parseRuntimeDate(value) {
@@ -44,6 +52,90 @@ function parseRuntimeDate(value) {
   }
   const date = new Date(raw);
   return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function getSystemStatusSignature(status) {
+  const data = status && typeof status === 'object' ? status : {};
+  const onlineUsers = Array.isArray(data.online_staff) ? data.online_staff : [];
+  return JSON.stringify({
+    online_count: Number(data.online_count || onlineUsers.length || 0),
+    pending_video: Number(data.pending_video || 0),
+    pending_image: Number(data.pending_image || 0),
+    announcements: Array.isArray(data.announcements) ? data.announcements.map((row) => String(row || '')) : [],
+    online_staff: onlineUsers.map((row) => ({
+      username: String(row?.username || '').trim(),
+      display_name: String(row?.display_name || '').trim(),
+      role: String(row?.role || '').trim(),
+      active_tasks: Number(row?.active_tasks || 0),
+      current_code: String(row?.current_code || '').trim(),
+      current_task: String(row?.current_task || '').trim(),
+      last_seen: Number(row?.last_seen || 0),
+      online_since: Number(row?.online_since || 0),
+      shift_started_at: Number(row?.shift_started_at || 0),
+      online_seconds: Number(row?.online_seconds || 0),
+    })),
+  });
+}
+
+function getSessionCollectionSignature(rows) {
+  const items = Array.isArray(rows) ? rows : [];
+  return JSON.stringify(items.map((row) => ({
+    username: String(row?.username || '').trim(),
+    role: String(row?.role || '').trim(),
+    activeTasks: Number(row?.activeTasks || 0),
+    codeTag: String(row?.codeTag || '').trim(),
+    effect: String(row?.effect || '').trim(),
+    last_seen: Number(row?.last_seen || 0),
+    online_since: Number(row?.online_since || 0),
+    online_seconds: Number(row?.online_seconds || 0),
+  })));
+}
+
+function normalizeOnlineSessions(onlineUsers = []) {
+  return (Array.isArray(onlineUsers) ? onlineUsers : []).map((row, idx) => ({
+    id: idx + 1,
+    staffId: row.username || '',
+    username: row.username || '',
+    displayName: row.display_name || row.username || '',
+    role: row.role || 'staff',
+    activeTasks: Number(row.active_tasks || 0),
+    codeTag: row.current_code || '',
+    effect: row.current_task || `${Number(row.active_tasks || 0)} task`,
+    startTime: row.last_seen || '',
+    display_name: row.display_name || row.username || '',
+    current_task: row.current_task || '',
+    current_code: row.current_code || '',
+    current_entries: Array.isArray(row.current_entries) ? row.current_entries : [],
+    shift_started_at: Number(row.shift_started_at || 0),
+    online_seconds: Number(row.online_seconds || 0),
+    last_seen: Number(row.last_seen || 0),
+    online_since: Number(row.online_since || 0),
+    status: 'active',
+  }));
+}
+
+function applySystemStatusSnapshot(status) {
+  const nextStatus = status && typeof status === 'object' ? status : {};
+  const nextSignature = getSystemStatusSignature(nextStatus);
+  const systemChanged = nextSignature !== _lastSystemStatusSignature;
+  if (systemChanged) {
+    AppData.systemStatus = {
+      online_staff: Array.isArray(nextStatus.online_staff) ? nextStatus.online_staff : [],
+      online_count: Number(nextStatus.online_count || 0),
+      pending_video: Number(nextStatus.pending_video || 0),
+      pending_image: Number(nextStatus.pending_image || 0),
+      announcements: Array.isArray(nextStatus.announcements) ? nextStatus.announcements.slice() : [],
+    };
+    _lastSystemStatusSignature = nextSignature;
+  }
+  const normalizedSessions = normalizeOnlineSessions(nextStatus.online_staff || []);
+  const nextSessionSignature = getSessionCollectionSignature(normalizedSessions);
+  const sessionsChanged = nextSessionSignature !== _lastSessionCollectionSignature;
+  if (sessionsChanged) {
+    AppData.sessions.splice(0, AppData.sessions.length, ...normalizedSessions);
+    _lastSessionCollectionSignature = nextSessionSignature;
+  }
+  return { systemChanged, sessionsChanged, onlineUsers: Array.isArray(nextStatus.online_staff) ? nextStatus.online_staff : [] };
 }
 
 function syncCurrentUserUI() {
@@ -79,12 +171,68 @@ function resetCreatorRuntimeState() {
 }
 
 // ---- AUTH FLOW ----
+function switchAuthTab(tab) {
+  const mode = String(tab || 'login').trim().toLowerCase() === 'register' ? 'register' : 'login';
+  const loginForm = document.getElementById('loginForm');
+  const recoverForm = document.getElementById('recoverForm');
+  const recoverPending = document.getElementById('recoverPending');
+  const registerForm = document.getElementById('registerForm');
+  const loginPending = document.getElementById('loginPending');
+  const registerPending = document.getElementById('registerPending');
+  const loginError = document.getElementById('loginError');
+  const recoverError = document.getElementById('recoverError');
+  const registerError = document.getElementById('registerError');
+  const tabLogin = document.getElementById('authTabLogin');
+  const tabRegister = document.getElementById('authTabRegister');
+  if (_registerPendingPollTimer) { clearInterval(_registerPendingPollTimer); _registerPendingPollTimer = null; }
+  if (_recoverPendingPollTimer) { clearInterval(_recoverPendingPollTimer); _recoverPendingPollTimer = null; }
+  if (loginPending) loginPending.style.display = 'none';
+  if (recoverPending) recoverPending.style.display = 'none';
+  if (registerPending) registerPending.style.display = 'none';
+  if (loginError) loginError.style.display = 'none';
+  if (recoverError) recoverError.style.display = 'none';
+  if (registerError) registerError.style.display = 'none';
+  if (loginForm) loginForm.style.display = mode === 'login' ? '' : 'none';
+  if (recoverForm) recoverForm.style.display = 'none';
+  if (registerForm) registerForm.style.display = mode === 'register' ? '' : 'none';
+  if (tabLogin) tabLogin.style.opacity = mode === 'login' ? '1' : '.7';
+  if (tabRegister) tabRegister.style.opacity = mode === 'register' ? '1' : '.7';
+}
+
 function showLoginScreen() {
+  document.body.classList.remove('app-booting');
   const overlay = document.getElementById('loginOverlay');
   if (overlay) { overlay.style.display = 'flex'; overlay.classList.remove('hidden'); }
-  document.getElementById('loginForm').style.display = '';
-  document.getElementById('loginPending').style.display = 'none';
-  document.getElementById('loginError').style.display = 'none';
+  switchAuthTab('login');
+}
+
+function showAuthBootScreen() {
+  const overlay = document.getElementById('loginOverlay');
+  const loginForm = document.getElementById('loginForm');
+  const recoverForm = document.getElementById('recoverForm');
+  const registerForm = document.getElementById('registerForm');
+  const registerPending = document.getElementById('registerPending');
+  const loginPending = document.getElementById('loginPending');
+  const pendingText = document.querySelector('#loginPending .pending-text');
+  const pendingTimer = document.getElementById('pendingTimer');
+  const tabLogin = document.getElementById('authTabLogin');
+  const tabRegister = document.getElementById('authTabRegister');
+  const loginError = document.getElementById('loginError');
+  const recoverError = document.getElementById('recoverError');
+  const registerError = document.getElementById('registerError');
+  if (overlay) { overlay.style.display = 'flex'; overlay.classList.remove('hidden'); }
+  if (loginForm) loginForm.style.display = 'none';
+  if (recoverForm) recoverForm.style.display = 'none';
+  if (registerForm) registerForm.style.display = 'none';
+  if (registerPending) registerPending.style.display = 'none';
+  if (loginPending) loginPending.style.display = '';
+  if (pendingText) pendingText.textContent = 'Đang khôi phục phiên đăng nhập...';
+  if (pendingTimer) pendingTimer.textContent = 'Vui lòng chờ';
+  if (loginError) loginError.style.display = 'none';
+  if (recoverError) recoverError.style.display = 'none';
+  if (registerError) registerError.style.display = 'none';
+  if (tabLogin) tabLogin.style.opacity = '.7';
+  if (tabRegister) tabRegister.style.opacity = '.7';
 }
 
 function hideLoginScreen() {
@@ -126,6 +274,329 @@ function showLoginError(msg) {
   el.textContent = msg; el.style.display = '';
 }
 
+function showRegisterError(msg) {
+  const el = document.getElementById('registerError');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.display = '';
+}
+
+function showRecoverError(msg) {
+  const el = document.getElementById('recoverError');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.display = '';
+}
+
+function showRecoverForm() {
+  const loginForm = document.getElementById('loginForm');
+  const recoverForm = document.getElementById('recoverForm');
+  const recoverPending = document.getElementById('recoverPending');
+  const loginError = document.getElementById('loginError');
+  const recoverError = document.getElementById('recoverError');
+  if (loginError) loginError.style.display = 'none';
+  if (recoverError) recoverError.style.display = 'none';
+  if (recoverPending) recoverPending.style.display = 'none';
+  if (loginForm) loginForm.style.display = 'none';
+  if (recoverForm) recoverForm.style.display = '';
+}
+window.showRecoverForm = showRecoverForm;
+
+function hideRecoverForm() {
+  const loginForm = document.getElementById('loginForm');
+  const recoverForm = document.getElementById('recoverForm');
+  const recoverPending = document.getElementById('recoverPending');
+  const recoverError = document.getElementById('recoverError');
+  if (recoverError) recoverError.style.display = 'none';
+  if (recoverForm) recoverForm.style.display = 'none';
+  if (recoverPending) recoverPending.style.display = 'none';
+  if (loginForm) loginForm.style.display = '';
+}
+window.hideRecoverForm = hideRecoverForm;
+
+function _setRegisterPendingRequestId(requestId) {
+  const value = String(requestId || '').trim();
+  try {
+    if (value) localStorage.setItem(REGISTER_PENDING_STORAGE_KEY, value);
+    else localStorage.removeItem(REGISTER_PENDING_STORAGE_KEY);
+  } catch (_) {}
+}
+
+function _getRegisterPendingRequestId() {
+  try {
+    return String(localStorage.getItem(REGISTER_PENDING_STORAGE_KEY) || '').trim();
+  } catch (_) {
+    return '';
+  }
+}
+
+function _clearRegisterPendingState() {
+  if (_registerPendingPollTimer) {
+    clearInterval(_registerPendingPollTimer);
+    _registerPendingPollTimer = null;
+  }
+  _setRegisterPendingRequestId('');
+}
+
+function _setRegisterPendingCredentials(data) {
+  try {
+    const payload = {
+      username: String(data?.username || '').trim(),
+      password: String(data?.password || ''),
+    };
+    if (!payload.username || !payload.password) {
+      sessionStorage.removeItem(REGISTER_PENDING_CREDENTIALS_KEY);
+      return;
+    }
+    sessionStorage.setItem(REGISTER_PENDING_CREDENTIALS_KEY, JSON.stringify(payload));
+  } catch (_) {}
+}
+
+function _getRegisterPendingCredentials() {
+  try {
+    const raw = sessionStorage.getItem(REGISTER_PENDING_CREDENTIALS_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return {
+      username: String(parsed?.username || '').trim(),
+      password: String(parsed?.password || ''),
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function _clearRegisterPendingCredentials() {
+  try {
+    sessionStorage.removeItem(REGISTER_PENDING_CREDENTIALS_KEY);
+  } catch (_) {}
+}
+
+function _setRecoverPendingRequestId(requestId) {
+  const value = String(requestId || '').trim();
+  try {
+    if (value) localStorage.setItem(RECOVER_PENDING_STORAGE_KEY, value);
+    else localStorage.removeItem(RECOVER_PENDING_STORAGE_KEY);
+  } catch (_) {}
+}
+
+function _getRecoverPendingRequestId() {
+  try {
+    return String(localStorage.getItem(RECOVER_PENDING_STORAGE_KEY) || '').trim();
+  } catch (_) {
+    return '';
+  }
+}
+
+function _clearRecoverPendingState() {
+  if (_recoverPendingPollTimer) {
+    clearInterval(_recoverPendingPollTimer);
+    _recoverPendingPollTimer = null;
+  }
+  _setRecoverPendingRequestId('');
+}
+
+function _setRecoverPendingCredentials(data) {
+  try {
+    const payload = {
+      username: String(data?.username || '').trim(),
+      password: String(data?.password || ''),
+      employeeCode: String(data?.employeeCode || '').trim(),
+    };
+    if (!payload.username || !payload.password || !payload.employeeCode) {
+      sessionStorage.removeItem(RECOVER_PENDING_CREDENTIALS_KEY);
+      return;
+    }
+    sessionStorage.setItem(RECOVER_PENDING_CREDENTIALS_KEY, JSON.stringify(payload));
+  } catch (_) {}
+}
+
+function _getRecoverPendingCredentials() {
+  try {
+    const raw = sessionStorage.getItem(RECOVER_PENDING_CREDENTIALS_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return {
+      username: String(parsed?.username || '').trim(),
+      password: String(parsed?.password || ''),
+      employeeCode: String(parsed?.employeeCode || '').trim(),
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function _clearRecoverPendingCredentials() {
+  try {
+    sessionStorage.removeItem(RECOVER_PENDING_CREDENTIALS_KEY);
+  } catch (_) {}
+}
+
+function _fillRecoveredLoginCredentials() {
+  const creds = _getRecoverPendingCredentials();
+  if (!creds || !creds.username || !creds.password) return;
+  const loginUsername = document.getElementById('loginUsername');
+  const loginPassword = document.getElementById('loginPassword');
+  if (loginUsername) loginUsername.value = creds.username;
+  if (loginPassword) loginPassword.value = creds.password;
+}
+
+function _showRecoverPendingMessage(message) {
+  const recoverPending = document.getElementById('recoverPending');
+  const recoverPendingText = document.getElementById('recoverPendingText');
+  const recoverForm = document.getElementById('recoverForm');
+  const loginForm = document.getElementById('loginForm');
+  const recoverError = document.getElementById('recoverError');
+  const loginError = document.getElementById('loginError');
+  if (recoverPendingText) recoverPendingText.textContent = message;
+  if (recoverError) recoverError.style.display = 'none';
+  if (loginError) loginError.style.display = 'none';
+  if (loginForm) loginForm.style.display = 'none';
+  if (recoverForm) recoverForm.style.display = 'none';
+  if (recoverPending) recoverPending.style.display = '';
+}
+
+function _formatSecondsLeft(seconds) {
+  const safe = Math.max(0, Number(seconds || 0));
+  const m = Math.floor(safe / 60);
+  const s = Math.floor(safe % 60);
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function _fillApprovedLoginCredentials() {
+  const creds = _getRegisterPendingCredentials();
+  if (!creds || !creds.username || !creds.password) return;
+  const loginUsername = document.getElementById('loginUsername');
+  const loginPassword = document.getElementById('loginPassword');
+  if (loginUsername) loginUsername.value = creds.username;
+  if (loginPassword) loginPassword.value = creds.password;
+}
+
+function _showRegisterPendingMessage(message) {
+  const pendingText = document.getElementById('registerPendingText');
+  if (pendingText) pendingText.textContent = message;
+  const registerForm = document.getElementById('registerForm');
+  const registerPending = document.getElementById('registerPending');
+  const registerError = document.getElementById('registerError');
+  if (registerError) registerError.style.display = 'none';
+  if (registerForm) registerForm.style.display = 'none';
+  if (registerPending) registerPending.style.display = '';
+}
+
+async function pollRegisterRequestStatus(requestId, options = {}) {
+  const reqId = String(requestId || '').trim();
+  if (!reqId) return;
+  const silent = !!options.silent;
+  try {
+    const data = await API.getRegistrationRequestStatus(reqId);
+    const status = String(data?.status || 'pending').trim().toLowerCase();
+    if (status === 'approved') {
+      _clearRegisterPendingState();
+      switchAuthTab('login');
+      _fillApprovedLoginCredentials();
+      showLoginError(`Chào mừng ${String(data?.display_name || data?.username || '').trim() || 'bạn'}. Tài khoản đã được duyệt, có thể đăng nhập.`);
+      return;
+    }
+    if (status === 'rejected') {
+      _clearRegisterPendingState();
+      switchAuthTab('register');
+      const reason = String(data?.reject_reason || '').trim();
+      const reviewer = String(data?.reviewer || '').trim();
+      let msg = 'Yêu cầu đăng ký đã bị từ chối.';
+      if (reason) msg += ` Lý do: ${reason}`;
+      if (reviewer) msg += ` Reviewer: ${reviewer}`;
+      showRegisterError(msg);
+      return;
+    }
+    _showRegisterPendingMessage(`Chờ Admin phê duyệt qua Telegram. Mã yêu cầu: ${reqId}`);
+  } catch (err) {
+    if (!silent) {
+      _showRegisterPendingMessage(`Chờ Admin phê duyệt qua Telegram. Mã yêu cầu: ${reqId}`);
+    }
+  }
+}
+
+function startRegisterPendingPoll(requestId) {
+  const reqId = String(requestId || '').trim();
+  if (!reqId) return;
+  _clearRegisterPendingState();
+  _setRegisterPendingRequestId(reqId);
+  _showRegisterPendingMessage(`Chờ Admin phê duyệt qua Telegram. Mã yêu cầu: ${reqId}`);
+  pollRegisterRequestStatus(reqId, { silent: true }).catch(() => {});
+  _registerPendingPollTimer = setInterval(() => {
+    pollRegisterRequestStatus(reqId, { silent: true }).catch(() => {});
+  }, 3000);
+}
+
+async function pollRecoverRequestStatus(requestId, options = {}) {
+  const reqId = String(requestId || '').trim();
+  if (!reqId) return;
+  const silent = !!options.silent;
+  try {
+    const data = await API.getPasswordResetRequestStatus(reqId);
+    const status = String(data?.status || 'pending').trim().toLowerCase();
+    if (status === 'approved') {
+      _clearRecoverPendingState();
+      switchAuthTab('login');
+      _fillRecoveredLoginCredentials();
+      _clearRecoverPendingCredentials();
+      showLoginError(`Yêu cầu reset của ${String(data?.display_name || data?.username || '').trim() || 'bạn'} đã được duyệt. Thông tin đăng nhập mới đã được điền sẵn.`);
+      return;
+    }
+    if (status === 'rejected') {
+      _clearRecoverPendingState();
+      showRecoverForm();
+      const reason = String(data?.reject_reason || '').trim();
+      const reviewer = String(data?.reviewer || '').trim();
+      let msg = 'Yêu cầu reset mật khẩu đã bị từ chối.';
+      if (reason) msg += ` Lý do: ${reason}`;
+      if (reviewer) msg += ` Reviewer: ${reviewer}`;
+      showRecoverError(msg);
+      return;
+    }
+    if (status === 'expired') {
+      _clearRecoverPendingState();
+      _clearRecoverPendingCredentials();
+      showRecoverForm();
+      showRecoverError('Yêu cầu reset mật khẩu đã hết hạn. Hãy gửi yêu cầu mới.');
+      return;
+    }
+    const secondsLeft = Math.max(0, Number(data?.seconds_left || 0));
+    _showRecoverPendingMessage(`Chờ Admin phê duyệt reset qua Telegram. Mã yêu cầu: ${reqId}. Còn lại: ${_formatSecondsLeft(secondsLeft)}`);
+  } catch (err) {
+    if (!silent) {
+      _showRecoverPendingMessage(`Chờ Admin phê duyệt reset qua Telegram. Mã yêu cầu: ${reqId}`);
+    }
+  }
+}
+
+function startRecoverPendingPoll(requestId) {
+  const reqId = String(requestId || '').trim();
+  if (!reqId) return;
+  _clearRecoverPendingState();
+  _setRecoverPendingRequestId(reqId);
+  _showRecoverPendingMessage(`Chờ Admin phê duyệt reset qua Telegram. Mã yêu cầu: ${reqId}`);
+  pollRecoverRequestStatus(reqId, { silent: true }).catch(() => {});
+  _recoverPendingPollTimer = setInterval(() => {
+    pollRecoverRequestStatus(reqId, { silent: true }).catch(() => {});
+  }, 3000);
+}
+
+function resetClientAuthState() {
+  try {
+    if (_pendingPollTimer) { clearInterval(_pendingPollTimer); _pendingPollTimer = null; }
+  } catch (_) {}
+  _clearRegisterPendingState();
+  _clearRecoverPendingState();
+  _clearRegisterPendingCredentials();
+  _clearRecoverPendingCredentials();
+  try { API.clearToken(); } catch (_) {}
+  AppData.authUser = null;
+  AppData.viewingAsUserId = '';
+  AppData.authSession = { userId: '', username: '', role: '', permissions: [] };
+  AppData.viewContext = { userId: '', username: '', mode: 'self' };
+}
+
 function startPendingPoll(loginId, expiresAt) {
   if (_pendingPollTimer) clearInterval(_pendingPollTimer);
   const timerEl = document.getElementById('pendingTimer');
@@ -152,11 +623,108 @@ function startPendingPoll(loginId, expiresAt) {
 
 function cancelPending() {
   if (_pendingPollTimer) { clearInterval(_pendingPollTimer); _pendingPollTimer = null; }
-  document.getElementById('loginForm').style.display = '';
-  document.getElementById('loginPending').style.display = 'none';
+  switchAuthTab('login');
+}
+
+async function handleRegisterRequest(e) {
+  e.preventDefault();
+  const btn = document.getElementById('registerBtn');
+  const username = document.getElementById('registerUsername')?.value.trim();
+  const displayName = document.getElementById('registerDisplayName')?.value.trim();
+  const password = document.getElementById('registerPassword')?.value || '';
+  const employeeCode = document.getElementById('registerEmployeeCode')?.value.trim() || '';
+  const role = document.getElementById('registerRole')?.value || 'staff';
+  const errEl = document.getElementById('registerError');
+  if (errEl) errEl.style.display = 'none';
+  if (!username || !password) {
+    showRegisterError('Username và mật khẩu là bắt buộc');
+    return;
+  }
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Đang gửi...';
+  }
+  try {
+    const data = await API.requestRegistration({
+      username,
+      password,
+      display_name: displayName || username,
+      role,
+      employee_code: employeeCode,
+    });
+    _setRegisterPendingCredentials({ username, password });
+    startRegisterPendingPoll(String(data?.request_id || '').trim());
+  } catch (err) {
+    showRegisterError(err && err.message ? err.message : 'Gửi yêu cầu đăng ký thất bại');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fa-solid fa-paper-plane"></i> Gửi yêu cầu đăng ký';
+    }
+  }
+}
+
+async function handleRecoverByEmployeeCode(e) {
+  e.preventDefault();
+  const btn = document.getElementById('recoverBtn');
+  const username = document.getElementById('recoverUsername')?.value.trim() || '';
+  const employeeCode = document.getElementById('recoverEmployeeCode')?.value.trim() || '';
+  const password = document.getElementById('recoverPassword')?.value || '';
+  const confirmPassword = document.getElementById('recoverPasswordConfirm')?.value || '';
+  const errEl = document.getElementById('recoverError');
+  if (errEl) errEl.style.display = 'none';
+  if (!username || !employeeCode || !password || !confirmPassword) {
+    showRecoverError('Tài khoản, mã nhân viên, mật khẩu mới và xác nhận mật khẩu là bắt buộc');
+    return;
+  }
+  if (password !== confirmPassword) {
+    showRecoverError('Xác nhận mật khẩu mới không khớp');
+    return;
+  }
+  if (password.length < 8) {
+    showRecoverError('Mật khẩu mới phải từ 8 ký tự');
+    return;
+  }
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Đang gửi yêu cầu...';
+  }
+  try {
+    const data = await API.recoverByEmployeeCode({
+      username,
+      employee_code: employeeCode,
+      password,
+    });
+    _setRecoverPendingCredentials({ username, password, employeeCode });
+    startRecoverPendingPoll(String(data?.request_id || '').trim());
+  } catch (err) {
+    showRecoverError(err && err.message ? err.message : 'Khôi phục thông tin đăng nhập thất bại');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fa-solid fa-key"></i> Gửi yêu cầu reset';
+    }
+  }
+}
+
+function restoreRegisterPendingState() {
+  const requestId = _getRegisterPendingRequestId();
+  if (!requestId) return;
+  switchAuthTab('register');
+  startRegisterPendingPoll(requestId);
+}
+
+function restoreRecoverPendingState() {
+  const requestId = _getRecoverPendingRequestId();
+  if (!requestId) return;
+  startRecoverPendingPoll(requestId);
 }
 
 async function onLoginSuccess(user) {
+  _clearRegisterPendingState();
+  _clearRecoverPendingState();
+  _clearRegisterPendingCredentials();
+  _clearRecoverPendingCredentials();
   // Set current user in AppData
   AppData.currentUser = {
     id: user.id,
@@ -194,6 +762,7 @@ async function onLoginSuccess(user) {
   applyRoleAccessUI();
   initCharts();
   startBackgroundPolling();
+  document.body.classList.remove('app-booting');
   hideLoginScreen();
 }
 
@@ -213,7 +782,7 @@ async function loadDataFromAPI() {
 
   try {
     const scopedUsername = String(getScopeUsername() || '').trim();
-    const [users, library, history, systemStatus, shiftConfig, activeWorkTask, currentShiftSummary, workTasks, providerSettings, providerCatalog] = await Promise.all([
+    const [users, library, history, systemStatus, shiftConfig, activeWorkTask, currentShiftSummary, workTasks, providerSettings, providerCatalog, shiftReports, qcQueue] = await Promise.all([
       safeFetch('/api/auth/users'),
       safeFetch('/api/library'),
       safeFetch('/api/history?limit=200'),
@@ -224,6 +793,8 @@ async function loadDataFromAPI() {
       safeFetch('/api/work-tasks'),
       safeFetch('/api/providers/settings'),
       safeFetch('/api/providers/catalog'),
+      safeFetch('/api/reports/shifts'),
+      safeFetch('/api/qc/queue'),
     ]);
 
     const onlineUsers = Array.isArray(systemStatus?.online_staff) ? systemStatus.online_staff : [];
@@ -232,6 +803,7 @@ async function loadDataFromAPI() {
     if (Array.isArray(users)) {
       const normalizedUsers = users.map(u => ({
         id: u.id, username: u.username, name: u.display_name || u.username, role: u.role || 'staff',
+        employeeCode: String(u.employee_code || '').trim(),
         avatar: (u.display_name || u.username).charAt(0).toUpperCase(),
         color: u.role === 'admin' ? '#D97A2B' : u.role === 'qc_manager' ? '#4A9EE8' : '#9B6EE0',
         status: onlineMap.has(String(u.username || '')) ? 'online' : (u.active ? 'away' : 'offline'),
@@ -245,40 +817,44 @@ async function loadDataFromAPI() {
       AppData.staff.splice(0, AppData.staff.length);
     }
     if (Array.isArray(library)) {
-      const normalizedLibrary = library.map(normalizeLibraryItem);
+      const normalizedLibrary = library.map(normalizeLibraryItem).filter(shouldKeepLibraryItem);
       AppData.library.splice(0, AppData.library.length, ...normalizedLibrary);
     } else if (strictProd) {
       AppData.library.splice(0, AppData.library.length);
+    }
+    if (Array.isArray(qcQueue)) {
+      setQCQueueData(qcQueue);
+    } else if (strictProd) {
+      AppData.qcQueue.splice(0, AppData.qcQueue.length);
     }
     if (Array.isArray(history)) {
       AppData.activityHistory.splice(0, AppData.activityHistory.length, ...history);
     } else if (strictProd) {
       AppData.activityHistory.splice(0, AppData.activityHistory.length);
     }
-    if (Array.isArray(onlineUsers)) {
-      const taskRows = Array.isArray(workTasks) ? workTasks : [];
-      const normalizedSessions = onlineUsers.map((row, idx) => ({
-        ...(taskRows.find((task) => String(task.user_name || '') === String(row.username || '') && String(task.status || '').toLowerCase() === 'active') || {}),
-        id: idx + 1,
-        staffId: row.username || '',
-        username: row.username || '',
-        displayName: row.display_name || row.username || '',
-        role: row.role || 'staff',
-        activeTasks: Number(row.active_tasks || 0),
-        codeTag: row.current_code || '',
-        effect: row.current_task || `${Number(row.active_tasks || 0)} task`,
-        startTime: row.last_seen || '',
-        display_name: row.display_name || row.username || '',
-        current_task: row.current_task || '',
-        current_code: row.current_code || '',
-        current_entries: Array.isArray(row.current_entries) ? row.current_entries : [],
-        shift_started_at: Number(row.shift_started_at || 0),
-        online_seconds: Number(row.online_seconds || 0),
-        last_seen: Number(row.last_seen || 0),
-        online_since: Number(row.online_since || 0),
-        status: 'active',
+    if (Array.isArray(shiftReports)) {
+      const normalizedShiftReports = shiftReports.map((row) => ({
+        ...row,
+        staffId: String(row.user_id || '').trim(),
+        userName: String(row.user_name || '').trim(),
+        userDisplay: String(row.user_display || '').trim(),
+        submittedAt: row.submitted_at || row.submittedAt || '',
+        totalTasks: Number(row.total_tasks || 0),
+        totalCredits: Number(row.total_credits || 0),
+        notes: String(row.notes || '').trim(),
       }));
-      AppData.sessions.splice(0, AppData.sessions.length, ...normalizedSessions);
+      AppData.shiftReports.splice(0, AppData.shiftReports.length, ...normalizedShiftReports);
+    } else if (strictProd) {
+      AppData.shiftReports.splice(0, AppData.shiftReports.length);
+    }
+    if (Array.isArray(onlineUsers)) {
+      applySystemStatusSnapshot({
+        online_staff: onlineUsers,
+        online_count: Number(systemStatus?.online_count || onlineUsers.length || 0),
+        pending_video: Number(systemStatus?.pending_video || 0),
+        pending_image: Number(systemStatus?.pending_image || 0),
+        announcements: Array.isArray(systemStatus?.announcements) ? systemStatus.announcements : [],
+      });
     } else if (strictProd) {
       AppData.sessions.splice(0, AppData.sessions.length);
     }
@@ -358,6 +934,7 @@ async function loadDataFromAPI() {
     if (strictProd) {
       AppData.staff.splice(0, AppData.staff.length);
       AppData.library.splice(0, AppData.library.length);
+      AppData.qcQueue.splice(0, AppData.qcQueue.length);
       AppData.images = [];
       AppData.sessions = [];
       AppData.creditLog = [];
@@ -393,15 +970,115 @@ function normalizeLibraryItem(t) {
     type,
     status,
     codeTag: t.product_code || '',
+    sessionId: t.session_id || '',
     staffId: t.staff_id || t.user_name || '',
     credits: Number(t.credit_used || 0),
     taskId: t.task_id || t.id,
     createdAt,
     resultUrl: t.result_url || '',
+    coverUrl: t.cover_url || '',
     sourceUrl: t.source_url || '',
+    prompt: t.prompt || '',
+    provider: t.provider || '',
+    modelId: t.model_id || '',
+    modelLabel: t.model_label || '',
+    duration: t.duration || '',
+    ratio: t.aspect_ratio || '',
+    cameraMove: t.camera_move || '',
+    effectGroup: String(t.effect_group || 'custom').trim().toLowerCase() || 'custom',
+    effectGroupDetail: String(t.effect_group_detail || '').trim(),
     qcStatus: qcStatus || null,
     qcNote: qcNote || '',
+    rejectReason: String(t.reject_reason || '').trim(),
+    qcReviewer: String(t.qc_reviewer || '').trim(),
+    qcReviewedAt: t.qc_reviewed_at || '',
   };
+}
+
+function getLibraryCollectionSignature(items) {
+  const rows = Array.isArray(items) ? items : [];
+  return JSON.stringify(rows.map((item) => ({
+    id: String(item?.id || '').trim(),
+    taskId: String(item?.taskId || '').trim(),
+    status: String(item?.status || '').trim(),
+    qcStatus: String(item?.qcStatus || '').trim(),
+    qcNote: String(item?.qcNote || '').trim(),
+    resultUrl: String(item?.resultUrl || '').trim(),
+    pct: Math.round(Number(item?.pct || 0) || 0),
+  })));
+}
+
+function normalizeQCQueueItem(row) {
+  if (!row || typeof row !== 'object') return null;
+  const submittedAtRaw = Number(row.submitted_at || row.submittedAt || 0);
+  const submittedAt = Number.isFinite(submittedAtRaw) ? submittedAtRaw : 0;
+  const taskId = String(row.task_id || row.taskId || '').trim();
+  const videoUrl = String(row.video_url || row.videoUrl || '').trim();
+  return {
+    id: String(row.id || '').trim(),
+    qcId: String(row.id || '').trim(),
+    taskId,
+    videoUrl,
+    resultUrl: videoUrl,
+    coverUrl: String(row.cover_url || row.coverUrl || '').trim(),
+    userName: String(row.user_name || row.userName || '').trim(),
+    userDisplay: String(row.user_display || row.userDisplay || '').trim(),
+    staffId: String(row.user_name || row.userName || '').trim(),
+    sessionId: String(row.session_id || row.sessionId || '').trim(),
+    codeTag: String(row.code_tag || row.codeTag || '').trim(),
+    taskIndex: Number(row.task_index || row.taskIndex || 0),
+    prompt: String(row.prompt || '').trim(),
+    effectGroup: String(row.effect_group || row.effectGroup || '').trim().toLowerCase(),
+    effectGroupDetail: String(row.effect_group_detail || row.effectGroupDetail || '').trim(),
+    provider: String(row.provider || '').trim().toLowerCase(),
+    modelId: String(row.model_id || row.modelId || '').trim(),
+    genMode: String(row.gen_mode || row.genMode || '').trim(),
+    duration: String(row.duration || '').trim(),
+    aspectRatio: String(row.aspect_ratio || row.aspectRatio || '').trim(),
+    creditUsed: Number(row.credit_used || row.creditUsed || 0),
+    note: String(row.note || '').trim(),
+    status: String(row.status || 'pending').trim().toLowerCase() || 'pending',
+    reviewer: String(row.reviewer || '').trim(),
+    rejectReason: String(row.reject_reason || row.rejectReason || '').trim(),
+    assignedQcUser: String(row.assigned_qc_user || row.assignedQcUser || '').trim(),
+    assignedQcDisplay: String(row.assigned_qc_display || row.assignedQcDisplay || '').trim(),
+    claimedBy: String(row.claimed_by || row.claimedBy || '').trim(),
+    claimedDisplay: String(row.claimed_display || row.claimedDisplay || '').trim(),
+    claimedAt: Number(row.claimed_at || row.claimedAt || 0),
+    submittedAt,
+    submittedAtText: submittedAt ? new Date(submittedAt * 1000).toLocaleString('vi-VN') : '-',
+    reviewedAt: Number(row.reviewed_at || row.reviewedAt || 0),
+    mediaType: 'video',
+    type: 'video',
+    name: String(row.code_tag || row.task_id || row.id || 'QC Item').trim(),
+  };
+}
+
+function setQCQueueData(rows) {
+  const normalizedQCQueue = Array.isArray(rows) ? rows.map(normalizeQCQueueItem).filter(Boolean) : [];
+  AppData.qcQueue.splice(0, AppData.qcQueue.length, ...normalizedQCQueue);
+}
+
+async function refreshQCQueue(options = {}) {
+  const silent = !!options.silent;
+  try {
+    const rows = await API.getQCQueue();
+    setQCQueueData(rows);
+    if (currentScreen === 'qc') buildQC();
+    return rows;
+  } catch (err) {
+    if (!silent && typeof showToast === 'function') showToast(err.message || 'Làm mới QC thất bại', 'error');
+    throw err;
+  }
+}
+
+function shouldKeepLibraryItem(item) {
+  if (!item || typeof item !== 'object') return false;
+  const type = String(item.type || '').toLowerCase();
+  if (type !== 'video') return true;
+  const status = String(item.status || '').trim().toLowerCase();
+  if (['processing', 'running', 'pending', 'queued', 'pending_qc'].includes(status)) return true;
+  return !!String(item.resultUrl || '').trim();
 }
 
 function formatLibraryCredits(value) {
@@ -458,7 +1135,7 @@ function logout() {
     showToast('Phải kết thúc ca trước khi đăng xuất', 'error');
     return;
   }
-  API.clearToken();
+  resetClientAuthState();
   showLoginScreen();
 }
 
@@ -472,10 +1149,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       await onLoginSuccess(me);
       return;
     } catch (_) {
-      API.clearToken();
+      resetClientAuthState();
     }
   }
   showLoginScreen();
+  restoreRegisterPendingState();
+  restoreRecoverPendingState();
 });
 
 window.addEventListener('beforeunload', (event) => {
@@ -488,11 +1167,23 @@ window.addEventListener('beforeunload', (event) => {
 function initAllScreens() {
   buildDashboard();
   buildCreator(); // defined in creator.js
-  buildQC();
-  buildHR();
+  if (canAccessScreen('qc')) buildQC();
+  else {
+    const el = document.getElementById('qcContent');
+    if (el) el.innerHTML = '<div class="card"><div class="card-title">Admin/QC only</div><div style="color:var(--muted);font-size:13px">Ban khong co quyen truy cap man hinh nay.</div></div>';
+  }
+  if (canAccessScreen('hr')) buildHR();
+  else {
+    const el = document.getElementById('hrContent');
+    if (el) el.innerHTML = '<div class="card"><div class="card-title">Admin only</div><div style="color:var(--muted);font-size:13px">Ban khong co quyen truy cap man hinh nay.</div></div>';
+  }
   buildLibrary();
   buildCreditsScreen();
-  buildSettings();
+  if (canAccessScreen('settings')) buildSettings();
+  else {
+    const el = document.getElementById('settingsContent');
+    if (el) el.innerHTML = '<div class="card"><div class="card-title">Admin only</div><div style="color:var(--muted);font-size:13px">Ban khong co quyen truy cap man hinh nay.</div></div>';
+  }
   normalizeMojibakeDom(document);
 }
 
@@ -507,6 +1198,10 @@ const ScreenPermissionMap = {
 };
 
 function getScreenBlockReason(screenId) {
+  const role = String(AppData.currentUser?.role || '').toLowerCase();
+  if (role === 'qc_manager' && !['dashboard', 'qc'].includes(String(screenId || '').toLowerCase())) {
+    return 'Role QC chỉ được truy cập Dashboard và QC';
+  }
   if (screenId === 'creator' && String(AppData.currentUser?.role || '').toLowerCase() === 'staff' && !AppData.activeShift) {
     return 'Phải bắt đầu ca ở Dashboard trước khi vào Creator Workspace';
   }
@@ -552,7 +1247,7 @@ function renderActiveShiftHeader() {
     clearTimeout(_activeShiftTimer);
     _activeShiftTimer = null;
   }
-  if (String(AppData.currentUser?.role || '').toLowerCase() !== 'staff' || !AppData.activeShift) {
+  if (!['staff', 'qc_manager'].includes(String(AppData.currentUser?.role || '').toLowerCase()) || !AppData.activeShift) {
     el.innerHTML = '';
     return;
   }
@@ -776,6 +1471,8 @@ function closeModal(id) {
 }
 
 // ---- NOTIFICATIONS ----
+let _lastUnreadNotificationCount = 0;
+
 async function loadNotifications() {
   const listEl = document.getElementById('notifList');
   const badgeEl = document.getElementById('notifBadge');
@@ -797,7 +1494,9 @@ async function loadNotifications() {
   try {
     const items = await API.getNotifications();
     const notifications = Array.isArray(items) ? items : [];
-    badgeEl.textContent = String(notifications.filter((n) => !n.read).length);
+    const unreadCount = notifications.filter((n) => !n.read).length;
+    badgeEl.textContent = String(unreadCount);
+    _lastUnreadNotificationCount = unreadCount;
     if (notifications.length === 0) {
       listEl.innerHTML = '<div class="notif-item"><div class="notif-body"><div class="notif-title">Chưa có thông báo</div></div></div>';
       return;
@@ -857,7 +1556,8 @@ async function refreshOnlinePresence() {
   try {
     await API.heartbeat({});
     const status = await API.getSystemStatus();
-    const onlineUsers = Array.isArray(status?.online_staff) ? status.online_staff : [];
+    const applied = applySystemStatusSnapshot(status);
+    const onlineUsers = Array.isArray(applied.onlineUsers) ? applied.onlineUsers : [];
     const currentUsername = String(getScopeUsername() || '').toLowerCase();
     const filtered = onlineUsers.filter((u) => String(u.username || '').toLowerCase() !== currentUsername);
     const onlineStaff = filtered.filter((u) => String(u.role || '') === 'staff');
@@ -876,9 +1576,29 @@ async function refreshOnlinePresence() {
       return;
     }
     peerEl.textContent = `Staff: ${onlineStaff.length} | QC: ${onlineQC.length}`;
+    return applied;
   } catch (_) {
     peerEl.textContent = 'Online: không tải được';
   }
+  return { systemChanged: false, sessionsChanged: false, onlineUsers: [] };
+}
+
+async function refreshNotificationBadge() {
+  try {
+    const badgeEl = document.getElementById('notifBadge');
+    if (!badgeEl) return;
+    if (notifOpen) {
+      await loadNotifications();
+      return;
+    }
+    const result = await API.getNotificationUnreadCount();
+    const unreadCount = Number(result?.count || 0) || 0;
+    badgeEl.textContent = String(unreadCount);
+    if (unreadCount > _lastUnreadNotificationCount) {
+      showToast('Có thông báo mới', 'info');
+    }
+    _lastUnreadNotificationCount = unreadCount;
+  } catch (_) {}
 }
 
 async function toggleNotif() {
@@ -903,85 +1623,91 @@ document.addEventListener('click', (e) => {
 let selectedQCItemId = null;
 
 function selectQCItem(el, name) {
-  document.querySelectorAll('#qcQueue .output-card').forEach(c => {
-    c.style.borderColor = '';
-    c.style.background = '';
-  });
-  el.style.borderColor = 'var(--brand)';
-  el.style.background = 'var(--brand-dim)';
-  const nameEl = document.getElementById('previewName');
-  if (nameEl) nameEl.textContent = name;
-  // Find item in AppData.library
-  selectedQCItemId = AppData.library.find(i => i.name === name && i.status === 'pending_qc')?.id || null;
-  showToast(`Preview: ${name}`, 'info');
+  selectedQCItemId = String(name || '').trim() || null;
+  const item = selectedQCItemId ? AppData.qcQueue.find(i => i.id === selectedQCItemId) : null;
+  const role = String(AppData.currentUser?.role || '').trim().toLowerCase();
+  if (item && role === 'qc_manager' && !String(item.assignedQcUser || '').trim()) {
+    API.claimQC(item.id)
+      .then(async () => { await loadDataFromAPI(); buildQC(); })
+      .catch((err) => { showToast(err.message || 'Nhận task QC thất bại', 'error'); buildQC(); });
+    return;
+  }
+  buildQC();
 }
 
-function approveItem() {
+async function approveItem() {
   // Role gate: only qc_manager or admin can approve
   const gate = validateBeforeApprove();
   if (!gate.ok) return;
 
-  const name = document.getElementById('previewName')?.textContent;
-  const item = selectedQCItemId ? AppData.library.find(i => i.id === selectedQCItemId) : AppData.library.find(i => i.name === name && i.status === 'pending_qc');
+  const item = selectedQCItemId ? AppData.qcQueue.find(i => i.id === selectedQCItemId) : null;
   if (!item) { showToast('Không tìm thấy item để duyệt', 'error'); return; }
-
-  item.status = 'approved';
-  item.qcById = AppData.currentUser.id;
-  item.qcNote = document.getElementById('qcComment')?.value || '';
-
-  // Send Telegram notification
-  sendTelegram(buildTelegramQCApproval(item, AppData.currentUser));
-  checkCreditAlerts();
-
-  showToast(`Approved: ${item.name}`, 'success');
+  try {
+    await API.approveQC(item.id, document.getElementById('qcComment')?.value || '');
+    await loadDataFromAPI();
+  } catch (err) {
+    showToast(err.message || 'Approve thất bại', 'error');
+    return;
+  }
+  showToast(`Approved: ${item.codeTag || item.taskId}`, 'success');
   buildQC(); // Re-render QC screen
   selectedQCItemId = null;
 }
 
-function rejectItem() {
+async function rejectItem() {
   const gate = validateBeforeApprove();
   if (!gate.ok) return;
 
-  const name = document.getElementById('previewName')?.textContent;
   const comment = document.getElementById('qcComment')?.value || '';
-  const item = selectedQCItemId ? AppData.library.find(i => i.id === selectedQCItemId) : AppData.library.find(i => i.name === name && i.status === 'pending_qc');
+  const item = selectedQCItemId ? AppData.qcQueue.find(i => i.id === selectedQCItemId) : null;
   if (!item) { showToast('Không tìm thấy item để từ chối', 'error'); return; }
-
-  item.status = 'rejected';
-  item.qcById = AppData.currentUser.id;
-  item.qcNote = comment || 'Không đạt yêu cầu';
-
-  // Send Telegram notification
-  sendTelegram(buildTelegramQCRejection(item, AppData.currentUser, item.qcNote));
-
-  showToast(`Rejected: ${item.name}${comment ? ' - ' + comment : ''}`, 'error');
+  try {
+    await API.rejectQC(item.id, comment || 'Không đạt yêu cầu');
+    await loadDataFromAPI();
+  } catch (err) {
+    showToast(err.message || 'Reject thất bại', 'error');
+    return;
+  }
+  showToast(`Rejected: ${item.codeTag || item.taskId}${comment ? ' - ' + comment : ''}`, 'error');
   buildQC();
   selectedQCItemId = null;
 }
 
-function approveAll() {
+async function releaseQCClaim() {
+  const item = selectedQCItemId ? AppData.qcQueue.find(i => i.id === selectedQCItemId) : null;
+  if (!item) { showToast('Không tìm thấy item QC', 'error'); return; }
+  try {
+    await API.releaseQC(item.id);
+    await refreshQCQueue();
+    showToast('Đã nhả task QC', 'success');
+  } catch (err) {
+    showToast(err.message || 'Nhả task QC thất bại', 'error');
+  }
+}
+
+async function approveAll() {
   const gate = validateBeforeApprove();
   if (!gate.ok) return;
 
   const queue = getQCQueue();
   if (queue.length === 0) { showToast('Queue trống', 'info'); return; }
-  queue.forEach(item => {
-    item.status = 'approved';
-    item.qcById = AppData.currentUser.id;
-    sendTelegram(buildTelegramQCApproval(item, AppData.currentUser));
-  });
+  for (const item of queue) {
+    await API.approveQC(item.id, '');
+  }
+  await loadDataFromAPI();
   checkCreditAlerts();
-  showToast(`Đã approve ${queue.length} items!`, 'success');
+  showToast(`Đã approve ${queue.length} items`, 'success');
   buildQC();
+  selectedQCItemId = null;
 }
 
 function sendTelegramReview() {
-  const name = document.getElementById('previewName')?.textContent;
-  const item = AppData.library.find(i => i.name === name);
-  if (item) {
-    sendTelegram(buildTelegramQCRequest(item));
+  const item = selectedQCItemId ? AppData.qcQueue.find(i => i.id === selectedQCItemId) : null;
+  if (!item) {
+    showToast('Không có item QC đang chọn', 'info');
+    return;
   }
-  showToast('Đã gửi link review qua Telegram!', 'info');
+  showToast(`Item ${item.codeTag || item.taskId} đã được gửi Telegram từ lúc staff submit`, 'info');
 }
 
 function sendShiftReport() {
@@ -1147,6 +1873,10 @@ function openStaffProfileModal(staffId, editable) {
           <label class="form-label">Tên hiển thị</label>
           <input id="staffProfileDisplayName" class="form-input" type="text" value="${staff.name || ''}" ${disabled}>
         </div>
+        <div style="grid-column:1 / -1">
+          <label class="form-label">Mã nhân viên</label>
+          <input id="staffProfileEmployeeCode" class="form-input" type="text" value="${staff.employeeCode || ''}" ${disabled} placeholder="F0202">
+        </div>
         <div>
           <label class="form-label">Vai trò</label>
           <select id="staffProfileRole" class="form-select" ${disabled}>
@@ -1215,6 +1945,7 @@ async function submitStaffProfile(staffId) {
     await API.updateUser(staffId, {
       display_name: document.getElementById('staffProfileDisplayName')?.value.trim() || staff.name,
       role: document.getElementById('staffProfileRole')?.value || staff.role,
+      employee_code: document.getElementById('staffProfileEmployeeCode')?.value.trim() || '',
       active: document.getElementById('staffProfileActive')?.value === '1',
       login_2fa_enabled: document.getElementById('staffProfile2FA')?.value === '1',
       password: document.getElementById('staffProfilePassword')?.value || '',
@@ -1338,6 +2069,7 @@ function extractChatText(result) {
 
 const AI_CHAT_SESSION_KEY = 'main';
 let aiChatMessages = [];
+let aiChatAttachment = null;
 
 function escapeHtml(text) {
   return String(text || '')
@@ -1365,7 +2097,7 @@ function renderChatHistory() {
   const chatEl = document.getElementById('chatMessages');
   if (!chatEl) return;
   if (!Array.isArray(aiChatMessages) || aiChatMessages.length === 0) {
-    chatEl.innerHTML = '<div class="chat-bubble ai">Xin chào. Tôi giúp bạn tạo prompt, phân tích ảnh, tư vấn quy trình.<br><small style="color:var(--muted)">Upload ảnh để tôi phân tích và gợi ý prompt.</small></div>';
+    chatEl.innerHTML = '<div class="chat-bubble ai">Xin chào. Đây là Trợ lý prompt. Tôi giúp bạn tạo prompt, phân tích ảnh, tư vấn quy trình.<br><small style="color:var(--muted)">Chọn ảnh, nhập câu lệnh, rồi gửi cùng một lượt.</small></div>';
     chatEl.scrollTop = chatEl.scrollHeight;
     return;
   }
@@ -1376,35 +2108,149 @@ function renderChatHistory() {
   chatEl.scrollTop = chatEl.scrollHeight;
 }
 
+function _revokeChatAttachmentUrl() {
+  try {
+    const url = String(aiChatAttachment?.previewUrl || '').trim();
+    if (url && url.startsWith('blob:')) URL.revokeObjectURL(url);
+  } catch (_) {}
+}
+
+function renderChatAttachment() {
+  const box = document.getElementById('chatPendingAttachment');
+  if (!box) return;
+  if (!aiChatAttachment || !aiChatAttachment.file) {
+    box.innerHTML = '';
+    box.style.display = 'none';
+    return;
+  }
+  const fileName = escapeHtml(String(aiChatAttachment.name || aiChatAttachment.file.name || 'image').trim());
+  const previewUrl = String(aiChatAttachment.previewUrl || '').trim();
+  box.style.display = '';
+  box.innerHTML = `
+    <div class="ai-chat-attachment-thumb">
+      ${previewUrl ? `<img src="${previewUrl}" alt="${fileName}">` : '<i class="fa-solid fa-image" style="color:var(--brand)"></i>'}
+    </div>
+    <div class="ai-chat-attachment-meta">
+      <div class="ai-chat-attachment-title">${fileName}</div>
+      <div class="ai-chat-attachment-sub">Ảnh sẽ được gửi kèm câu lệnh tiếp theo</div>
+    </div>
+    <button type="button" class="ai-chat-attachment-clear" onclick="clearChatAttachment()" title="Bỏ ảnh đính kèm">
+      <i class="fa-solid fa-xmark"></i>
+    </button>
+  `;
+}
+
+function clearChatAttachment(options = {}) {
+  const silent = !!options.silent;
+  _revokeChatAttachmentUrl();
+  aiChatAttachment = null;
+  renderChatAttachment();
+  if (!silent) showToast('Đã bỏ ảnh đính kèm', 'info');
+}
+
+function setChatAttachment(file, previewUrl = '', name = '') {
+  if (!file) return;
+  _revokeChatAttachmentUrl();
+  aiChatAttachment = {
+    file,
+    previewUrl: String(previewUrl || '').trim(),
+    name: String(name || file.name || 'image').trim() || 'image',
+  };
+  renderChatAttachment();
+  const input = document.getElementById('chatInput');
+  if (input) input.focus();
+  showToast(`Đã gắn ảnh: ${aiChatAttachment.name}`, 'success');
+}
+
+function _buildAnalyzeResponseText(resp, fallbackName = '') {
+  const analysis = String(resp?.analysis || resp?.summary || resp?.description || resp?.message || '').trim();
+  const imagePrompts = Array.isArray(resp?.image_prompts) ? resp.image_prompts.filter(Boolean) : [];
+  const videoPrompts = Array.isArray(resp?.video_prompts) ? resp.video_prompts.filter(Boolean) : [];
+  const prompt = String(resp?.prompt || resp?.suggested_prompt || resp?.analysis?.prompt || '').trim();
+  const chunks = [];
+  if (analysis) chunks.push(`Nhận diện: ${analysis}`);
+  if (prompt) chunks.push(`Prompt gợi ý:\n${prompt}`);
+  if (imagePrompts.length) chunks.push(`Prompt ảnh:\n- ${imagePrompts.join('\n- ')}`);
+  if (videoPrompts.length) chunks.push(`Prompt video:\n- ${videoPrompts.join('\n- ')}`);
+  if (chunks.length) return chunks.join('\n\n');
+  return `Đã phân tích ảnh${fallbackName ? `: ${fallbackName}` : ''}.`;
+}
+
+function _appendAnalyzeResponseBubble(resp, fileName = '') {
+  const chatEl = document.getElementById('chatMessages');
+  if (!chatEl) return;
+  const analysis = String(resp?.analysis || resp?.summary || resp?.description || resp?.message || '').trim();
+  const imagePrompts = Array.isArray(resp?.image_prompts) ? resp.image_prompts.filter(Boolean) : [];
+  const videoPrompts = Array.isArray(resp?.video_prompts) ? resp.video_prompts.filter(Boolean) : [];
+  const prompt = String(resp?.prompt || resp?.suggested_prompt || resp?.analysis?.prompt || '').trim();
+  const fileLabel = escapeHtml(String(fileName || '').trim());
+  const promptBlocks = [];
+  if (prompt) {
+    promptBlocks.push(`<div style="font-size:11px;margin-bottom:4px"><strong>Prompt gợi ý:</strong></div><div class="ai-prompt-suggestion" onclick="navigator.clipboard.writeText(this.textContent.trim());showToast('Đã copy prompt','success')">${escapeHtml(prompt)}</div>`);
+  }
+  if (imagePrompts.length) {
+    promptBlocks.push(`<div style="font-size:11px;margin-bottom:4px"><strong>Prompt ảnh:</strong></div>${imagePrompts.map((item) => `<div class="ai-prompt-suggestion" onclick="navigator.clipboard.writeText(this.textContent.trim());showToast('Đã copy prompt','success')">${escapeHtml(String(item))}</div>`).join('')}`);
+  }
+  if (videoPrompts.length) {
+    promptBlocks.push(`<div style="font-size:11px;margin-bottom:4px"><strong>Prompt video:</strong></div>${videoPrompts.map((item) => `<div class="ai-prompt-suggestion" onclick="navigator.clipboard.writeText(this.textContent.trim());showToast('Đã copy prompt','success')">${escapeHtml(String(item))}</div>`).join('')}`);
+  }
+  chatEl.innerHTML += `
+    <div class="chat-bubble ai">
+      <div style="font-weight:600;margin-bottom:4px"><i class="fa-solid fa-magnifying-glass-chart" style="color:var(--brand)"></i> Trợ lý prompt</div>
+      ${fileLabel ? `<div style="font-size:11px;margin-bottom:6px;color:var(--muted)"><strong>${fileLabel}</strong></div>` : ''}
+      <div style="font-size:11px;margin-bottom:6px"><strong>Nhận diện:</strong> ${escapeHtml(analysis || 'Không có summary từ API')}</div>
+      ${promptBlocks.join('')}
+    </div>`;
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
 async function sendChat() {
   const input = document.getElementById('chatInput');
   if (!input) return;
   const msg = input.value.trim();
-  if (!msg) return;
+  const attachment = aiChatAttachment && aiChatAttachment.file ? aiChatAttachment : null;
+  if (!msg && !attachment) return;
   
   const chatEl = document.getElementById('chatMessages');
   if (!chatEl) return;
-  aiChatMessages.push({ role: 'user', content: msg });
+  const userMessageText = attachment
+    ? `${attachment.name}${msg ? `\nYêu cầu: ${msg}` : '\nYêu cầu: Phân tích ảnh và gợi ý prompt.'}`
+    : msg;
+  aiChatMessages.push({ role: 'user', content: userMessageText });
   renderChatHistory();
   input.value = '';
   input.disabled = true;
+  const uploadBtn = document.querySelector('.ai-upload-btn');
+  if (uploadBtn) uploadBtn.setAttribute('disabled', 'disabled');
   await saveChatHistory();
   const loadingId = `ai-loading-${Date.now()}`;
-  chatEl.innerHTML += `<div class="chat-bubble ai" id="${loadingId}"><i class="fa-solid fa-spinner fa-spin"></i> Đang hỏi Gemini 2.5 Flash...</div>`;
+  chatEl.innerHTML += `<div class="chat-bubble ai" id="${loadingId}"><i class="fa-solid fa-spinner fa-spin"></i> Trợ lý prompt đang xử lý...</div>`;
   chatEl.scrollTop = chatEl.scrollHeight;
 
   try {
-    const result = await API.chatAgent([
-      {
-        role: 'user',
-        content: [
-          { type: 'text', text: msg },
-        ],
-      },
-    ], 'gemini-2.5-flash');
-    const resp = extractChatText(result) || 'Không có nội dung trả về từ AI.';
-    aiChatMessages.push({ role: 'assistant', content: resp });
-    renderChatHistory();
+    if (attachment) {
+      const fd = new FormData();
+      fd.append('file', attachment.file, attachment.name || attachment.file.name || 'image');
+      fd.append('user_prompt', msg || 'Phân tích ảnh và gợi ý prompt.');
+      const resp = await API.chatAnalyze(fd);
+      const text = _buildAnalyzeResponseText(resp, attachment.name);
+      aiChatMessages.push({ role: 'assistant', content: text });
+      renderChatHistory();
+      _appendAnalyzeResponseBubble(resp, attachment.name);
+      clearChatAttachment({ silent: true });
+    } else {
+      const result = await API.chatAgent([
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: msg },
+          ],
+        },
+      ], 'gemini-2.5-flash');
+      const resp = extractChatText(result) || 'Không có nội dung trả về từ AI.';
+      aiChatMessages.push({ role: 'assistant', content: resp });
+      renderChatHistory();
+    }
     await saveChatHistory();
   } catch (err) {
     const msgErr = err && err.message ? err.message : 'Gọi AI thất bại';
@@ -1416,6 +2262,7 @@ async function sendChat() {
     }
   } finally {
     input.disabled = false;
+    if (uploadBtn) uploadBtn.removeAttribute('disabled');
     input.focus();
     chatEl.scrollTop = chatEl.scrollHeight;
   }
@@ -1443,6 +2290,7 @@ async function clearChatHistory() {
     await API.deleteChatHistory(AI_CHAT_SESSION_KEY);
   } catch (_) {}
   renderChatHistory();
+  clearChatAttachment({ silent: true });
   showToast('Đã xóa lịch sử chat', 'info');
 }
 
@@ -1469,57 +2317,12 @@ function handleAIImageUpload(event) {
   const file = event.target.files[0];
   if (!file) return;
   event.target.value = '';
-
-  const chatEl = document.getElementById('chatMessages');
-  if (!chatEl) return;
-
-  // Read file as thumbnail
-  const reader = new FileReader();
-  reader.onload = function(e) {
-    // Show user message with image thumbnail
-    chatEl.innerHTML += `
-      <div class="chat-bubble user">
-        <div class="ai-chat-img-thumb">
-          <img src="${e.target.result}" alt="${file.name}">
-        </div>
-        <span>Phân tích ảnh: ${file.name}</span>
-      </div>`;
-    chatEl.scrollTop = chatEl.scrollHeight;
-
-    (async () => {
-      try {
-        const fd = new FormData();
-        fd.append('file', file, file.name);
-        const resp = await API.chatAnalyze(fd);
-        const summary = String(resp?.summary || resp?.description || resp?.message || '').trim();
-        const prompt = String(
-          resp?.prompt ||
-          resp?.suggested_prompt ||
-          resp?.analysis?.prompt ||
-          ''
-        ).trim();
-        chatEl.innerHTML += `
-          <div class="chat-bubble ai">
-            <div style="font-weight:600;margin-bottom:4px"><i class="fa-solid fa-magnifying-glass-chart" style="color:var(--brand)"></i> Phân tích ảnh</div>
-            <div style="font-size:11px;margin-bottom:6px;color:var(--muted)"><strong>${file.name}</strong></div>
-            <div style="font-size:11px;margin-bottom:6px"><strong>Nhận diện:</strong> ${summary || 'Không có summary từ API'}</div>
-            <div style="font-size:11px;margin-bottom:4px"><strong>Prompt gợi ý:</strong></div>
-            <div class="ai-prompt-suggestion" onclick="navigator.clipboard.writeText(this.textContent.trim());showToast('Đã copy prompt','success')">${prompt || 'Không có prompt gợi ý từ API'}</div>
-          </div>`;
-        aiChatMessages.push({ role: 'user', content: `Phân tích ảnh: ${file.name}` });
-        aiChatMessages.push({ role: 'assistant', content: `Nhận diện: ${summary || 'Không có summary từ API'}\nPrompt gợi ý:\n${prompt || 'Không có prompt gợi ý từ API'}` });
-      } catch (err) {
-        chatEl.innerHTML += `
-          <div class="chat-bubble ai">
-            <div style="font-weight:600;margin-bottom:4px"><i class="fa-solid fa-triangle-exclamation" style="color:var(--red)"></i> Phân tích ảnh</div>
-            <div style="font-size:11px">Lỗi gọi API /api/chat/analyze: ${err && err.message ? err.message : err}</div>
-          </div>`;
-      }
-      chatEl.scrollTop = chatEl.scrollHeight;
-      await saveChatHistory();
-    })();
-  };
-  reader.readAsDataURL(file);
+  try {
+    const previewUrl = URL.createObjectURL(file);
+    setChatAttachment(file, previewUrl, file.name);
+  } catch (_) {
+    setChatAttachment(file, '', file.name);
+  }
 }
 
 // ---- AI CHAT TABS & FOLDER BROWSER ----
@@ -1614,7 +2417,7 @@ function aiFolderGoRoot() {
 }
 
 function aiAnalyzeImage(imgId) {
-  // Switch to chat tab and auto-analyze
+  // Switch to chat tab and attach image
   const img = AppData.images.find(i => i.id === imgId);
   if (!img) return;
 
@@ -1627,49 +2430,23 @@ function aiAnalyzeImage(imgId) {
   const chatEl = document.getElementById('chatMessages');
   if (!chatEl) return;
 
-  chatEl.innerHTML += `<div class="chat-bubble user"><i class="fa-solid fa-image" style="color:var(--blue)"></i> Phân tích: ${img.name}</div>`;
-  chatEl.scrollTop = chatEl.scrollHeight;
-
   if (!img._file) {
     chatEl.innerHTML += `
       <div class="chat-bubble ai">
-        <div style="font-weight:600;margin-bottom:4px"><i class="fa-solid fa-circle-info" style="color:var(--blue)"></i> Phân tích ảnh</div>
-        <div style="font-size:11px">Ảnh này không còn file gốc trong phiên hiện tại, hãy upload lại để gọi API analyze.</div>
+        <div style="font-weight:600;margin-bottom:4px"><i class="fa-solid fa-circle-info" style="color:var(--blue)"></i> Trợ lý prompt</div>
+        <div style="font-size:11px">Ảnh này không còn file gốc trong phiên hiện tại, hãy upload lại để gửi cùng câu lệnh.</div>
       </div>`;
     chatEl.scrollTop = chatEl.scrollHeight;
     return;
   }
-  (async () => {
-    try {
-      const fd = new FormData();
-      fd.append('file', img._file, img.name || img._file.name || 'image.png');
-      const resp = await API.chatAnalyze(fd);
-      const summary = String(resp?.summary || resp?.description || resp?.message || '').trim();
-      const prompt = String(
-        resp?.prompt ||
-        resp?.suggested_prompt ||
-        resp?.analysis?.prompt ||
-        ''
-      ).trim();
-      chatEl.innerHTML += `
-        <div class="chat-bubble ai">
-          <div style="font-weight:600;margin-bottom:4px"><i class="fa-solid fa-magnifying-glass-chart" style="color:var(--brand)"></i> Phân tích: ${img.name}</div>
-          <div style="font-size:11px;margin-bottom:6px"><strong>Nhận diện:</strong> ${summary || 'Không có summary từ API'}</div>
-          <div style="font-size:11px;margin-bottom:4px"><strong>Prompt gợi ý:</strong></div>
-          <div class="ai-prompt-suggestion" onclick="navigator.clipboard.writeText(this.textContent.trim());showToast('Đã copy prompt','success')">${prompt || 'Không có prompt gợi ý từ API'}</div>
-        </div>`;
-      aiChatMessages.push({ role: 'user', content: `Phân tích: ${img.name}` });
-      aiChatMessages.push({ role: 'assistant', content: `Nhận diện: ${summary || 'Không có summary từ API'}\nPrompt gợi ý:\n${prompt || 'Không có prompt gợi ý từ API'}` });
-      await saveChatHistory();
-    } catch (err) {
-      chatEl.innerHTML += `
-        <div class="chat-bubble ai">
-          <div style="font-weight:600;margin-bottom:4px"><i class="fa-solid fa-triangle-exclamation" style="color:var(--red)"></i> Phân tích ảnh</div>
-          <div style="font-size:11px">Lỗi gọi API /api/chat/analyze: ${err && err.message ? err.message : err}</div>
-        </div>`;
-    }
-    chatEl.scrollTop = chatEl.scrollHeight;
-  })();
+  try {
+    const previewUrl = URL.createObjectURL(img._file);
+    setChatAttachment(img._file, previewUrl, img.name || img._file.name || 'image.png');
+  } catch (_) {
+    setChatAttachment(img._file, '', img.name || img._file.name || 'image.png');
+  }
+  const input = document.getElementById('chatInput');
+  if (input) input.focus();
 }
 
 // ---- AI FOLDER RENAME ----
@@ -1765,7 +2542,7 @@ function renderCreditChart() {
   creditChartInstance = new Chart(ctx, {
     type: 'doughnut',
     data: {
-      labels: ['Video (Kling)','Image Edit','AI Chat','Khác'],
+      labels: ['Video (Kling)','Image Edit','Trợ lý prompt','Khác'],
       datasets: [{ data:[44,24,16,17], backgroundColor:['#D97A2B','#4A9EE8','#9B6EE0','#6FAF4F'], borderColor:'#2C2C2E', borderWidth:3 }]
     },
     options: {
@@ -1824,7 +2601,13 @@ function startBackgroundPolling() {
     const token = (typeof API !== 'undefined' && API && typeof API.getToken === 'function') ? String(API.getToken() || '').trim() : '';
     if (!token) return;
     try {
-      await refreshOnlinePresence();
+      const presenceUpdate = await refreshOnlinePresence();
+      if (currentScreen === 'dashboard' && (presenceUpdate?.systemChanged || presenceUpdate?.sessionsChanged)) {
+        buildDashboard();
+      }
+    } catch (_) {}
+    try {
+      await refreshNotificationBadge();
     } catch (_) {}
     try {
       // Recover stuck media only when needed to avoid noisy 500 spam and extra load.
@@ -1838,20 +2621,36 @@ function startBackgroundPolling() {
       }
     } catch (_) {}
     try {
-      const lib = await API.getLibrary();
-      if (Array.isArray(lib)) {
-        const normalizedLibrary = lib.map(normalizeLibraryItem);
-        AppData.library.splice(0, AppData.library.length, ...normalizedLibrary);
-        if (typeof window.syncCreatorQCFromLibrary === 'function') {
-          window.syncCreatorQCFromLibrary();
+      const hasProcessing = (Array.isArray(AppData.library) ? AppData.library : []).some((item) => {
+        const status = String(item?.status || '').toLowerCase();
+        return status === 'processing' || status === 'pending_qc';
+      });
+      const shouldRefreshLibrary = currentScreen === 'creator' || currentScreen === 'library' || currentScreen === 'dashboard' || hasProcessing;
+      if (shouldRefreshLibrary) {
+        const lib = await API.getLibrary();
+        if (Array.isArray(lib)) {
+          const normalizedLibrary = lib.map(normalizeLibraryItem).filter(shouldKeepLibraryItem);
+          const beforeSignature = getLibraryCollectionSignature(AppData.library);
+          const nextSignature = getLibraryCollectionSignature(normalizedLibrary);
+          if (beforeSignature !== nextSignature) {
+            AppData.library.splice(0, AppData.library.length, ...normalizedLibrary);
+            if (typeof window.syncCreatorQCFromLibrary === 'function') {
+              window.syncCreatorQCFromLibrary();
+            }
+            if (currentScreen === 'library') buildLibrary();
+            if (currentScreen === 'dashboard') buildDashboard();
+            if (currentScreen === 'creator' && typeof window.renderLibraryIfChanged === 'function') {
+              window.renderLibraryIfChanged(true);
+            } else if (currentScreen === 'creator' && typeof window.renderLibrary === 'function') {
+              window.renderLibrary();
+            }
+          }
         }
-        if (currentScreen === 'library') buildLibrary();
-        if (currentScreen === 'dashboard') buildDashboard();
-        if (currentScreen === 'qc') buildQC();
-        if (currentScreen === 'creator' && typeof window.renderLibrary === 'function') {
-          window.renderLibrary();
-          if (typeof window.renderActiveCombo === 'function') window.renderActiveCombo();
-        }
+      }
+    } catch (_) {}
+    try {
+      if (currentScreen === 'qc') {
+        await refreshQCQueue({ silent: true });
       }
     } catch (_) {}
   }, 15000);
