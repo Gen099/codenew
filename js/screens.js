@@ -3,11 +3,25 @@
 // All data comes from AppData in js/data.js
 
 let dashboardViewMode = 'today';
-let libraryFilters = { code: '', type: '', status: '', limit: 8 };
-let qcStaffFilter = '';
+let libraryFilters = { code: '', type: '', status: '', effect: '', limit: 8 };
+let qcFilters = { staffId: '', date: '', effect: '', assigned: '', status: 'pending', limit: 20 };
 let staffFilters = { query: '', role: '', status: '' };
 let dashboardFilters = { period: 'today', user: '', group: '', month: '' };
 let staffShiftSelectedDate = '';
+let dashboardSelectedDate = '';
+let settingsKeyHistoryCache = [];
+const WORK_SESSION_EFFECT_GROUPS = [
+  { id: 'none', label: '-- None --' },
+  { id: 'add_interior', label: 'Th\u00eam n\u1ed9i th\u1ea5t' },
+  { id: 'four_seasons', label: '4 M\u00f9a' },
+  { id: 'day_to_night', label: 'Ng\u00e0y sang \u0111\u00eam' },
+  { id: 'noel_decor', label: 'Trang tr\u00ed Noel' },
+  { id: 'add_person', label: 'Th\u00eam ng\u01b0\u1eddi' },
+  { id: 'explosion', label: 'V\u1ee5 n\u1ed5' },
+  { id: 'fire_effect', label: 'Hi\u1ec7u \u1ee9ng l\u1eeda' },
+  { id: 'partial_build', label: 'X\u00e2y d\u1ef1ng t\u1eebng ph\u1ea7n' },
+  { id: 'custom', label: 'T\u00f9y ch\u1ecdn kh\u00e1c' },
+];
 
 function formatOnlineDuration(seconds) {
   const total = Math.max(0, Number(seconds || 0));
@@ -17,10 +31,103 @@ function formatOnlineDuration(seconds) {
   return `${minutes} ph\u00FAt`;
 }
 
+function getEffectGroupLabel(effectGroup) {
+  const key = String(effectGroup || '').trim().toLowerCase() || 'none';
+  const found = WORK_SESSION_EFFECT_GROUPS.find((row) => String(row.id || '').trim().toLowerCase() === key);
+  return found ? found.label : '-- None --';
+}
+
+function getDashboardSelectedDateForMonth(year, monthIndex) {
+  const now = new Date();
+  const normalized = `${year}-${String(monthIndex + 1).padStart(2, '0')}`;
+  const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  if (normalized === currentMonth) return `${normalized}-${String(now.getDate()).padStart(2, '0')}`;
+  return `${normalized}-01`;
+}
+
+function ensureDashboardSelectedDate(year, monthIndex) {
+  const expectedPrefix = `${year}-${String(monthIndex + 1).padStart(2, '0')}-`;
+  if (!String(dashboardSelectedDate || '').startsWith(expectedPrefix)) {
+    dashboardSelectedDate = getDashboardSelectedDateForMonth(year, monthIndex);
+  }
+  return dashboardSelectedDate;
+}
+
+function buildDashboardDayDetailCard(selectedDate, options = {}) {
+  const scopedUsername = String(options.scopedUsername || '').trim();
+  const items = (Array.isArray(options.items) ? options.items : []).filter((item) => {
+    const created = String(item.createdAt || '').trim();
+    if (!created.startsWith(selectedDate)) return false;
+    if (!scopedUsername) return true;
+    const owner = String(item.username || item.userName || getStaff(item.staffId || '').username || '').trim();
+    return !owner || owner === scopedUsername;
+  });
+  const reports = (Array.isArray(options.reports) ? options.reports : []).filter((row) => {
+    const dt = parseRuntimeDate(row.submittedAt || row.submitted_at);
+    if (!dt) return false;
+    const dateKey = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+    if (dateKey !== selectedDate) return false;
+    if (!scopedUsername) return true;
+    return String(row.userName || row.user_name || '').trim() === scopedUsername;
+  });
+  const daySummary = {
+    totalMedia: items.length,
+    video: items.filter((item) => String(item.type || '').toLowerCase() === 'video').length,
+    image: items.filter((item) => String(item.type || '').toLowerCase() === 'image').length,
+    credits: items.reduce((sum, item) => sum + Number(item.credits || item.credit_used || 0), 0),
+    pendingQc: items.filter((item) => String(item.status || '').toLowerCase() === 'pending_qc').length,
+  };
+  return `
+    <div class="card" style="margin-top:16px">
+      <div class="card-header">
+        <div class="card-title"><i class="fa-solid fa-chart-line"></i> Chi tiet ngay ${selectedDate}</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <span class="badge badge-orange">${daySummary.totalMedia} media</span>
+          <span class="badge badge-purple">${reports.length} bao cao ca</span>
+        </div>
+      </div>
+      <div class="grid-4" style="gap:12px;margin-bottom:12px">
+        <div class="stat-card"><div class="stat-value">${daySummary.video}</div><div class="stat-label">Video</div></div>
+        <div class="stat-card"><div class="stat-value">${daySummary.image}</div><div class="stat-label">Anh</div></div>
+        <div class="stat-card"><div class="stat-value">${daySummary.pendingQc}</div><div class="stat-label">Cho QC</div></div>
+        <div class="stat-card"><div class="stat-value">${daySummary.credits}</div><div class="stat-label">Credits</div></div>
+      </div>
+      <div class="grid-2" style="gap:16px">
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th>Media</th><th>CODE</th><th>Nhom effect</th><th>Trang thai</th><th>Credits</th><th>Tao luc</th></tr></thead>
+            <tbody>
+              ${items.length === 0
+                ? '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:14px">Khong co du lieu ngay nay</td></tr>'
+                : items.map((item) => `<tr><td>${item.name || '-'}</td><td>${item.codeTag || '-'}</td><td>${getEffectGroupLabel(item.effectGroup || item.effect_group || 'none')}</td><td>${item.status || '-'}</td><td style="color:var(--yellow)">${Number(item.credits || item.credit_used || 0)}</td><td>${item.createdAt || '-'}</td></tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th>Nhan su</th><th>Tasks</th><th>Credits</th><th>Gui luc</th><th>Ghi chu</th></tr></thead>
+            <tbody>
+              ${reports.length === 0
+                ? '<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:14px">Khong co bao cao ca ngay nay</td></tr>'
+                : reports.map((row) => {
+                    const staff = getStaff(row.staffId || row.userName || '');
+                    const submitted = parseRuntimeDate(row.submittedAt || row.submitted_at);
+                    return `<tr><td>${staff.name || row.userDisplay || row.userName || '-'}</td><td>${Number(row.totalTasks || row.total_tasks || 0)}</td><td style="color:var(--yellow)">${Number(row.totalCredits || row.total_credits || 0)}</td><td>${submitted ? submitted.toLocaleString('vi-VN') : '-'}</td><td>${row.notes || '-'}</td></tr>`;
+                  }).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 // ---- DASHBOARD SCREEN ----
 function buildDashboard() {
   const viewProfile = (typeof getViewProfile === 'function') ? getViewProfile() : (AppData.currentUser || {});
-  if (String(AppData.currentUser?.role || '').toLowerCase() === 'staff') {
+  const isViewingStaff = !!String(AppData.viewingAsUserId || '').trim();
+  const role = String(viewProfile?.role || '').toLowerCase();
+  if (isViewingStaff || role === 'staff' || role === 'qc_manager') {
     return buildStaffDashboard();
   }
   const el = document.getElementById('dashboardContent');
@@ -43,6 +150,7 @@ function buildDashboard() {
     : [now.getFullYear(), now.getMonth() + 1];
   const monthStart = new Date(selectedYear, selectedMonth - 1, 1);
   const monthDays = new Date(selectedYear, selectedMonth, 0).getDate();
+  const selectedDate = ensureDashboardSelectedDate(selectedYear, selectedMonth - 1);
   const monthGrid = {
     year: selectedYear,
     month: selectedMonth - 1,
@@ -89,7 +197,9 @@ function buildDashboard() {
   const dayHeaders = Array.from({length: monthGrid.daysInMonth}, (_,i) => {
     const d = new Date(monthGrid.year, monthGrid.month, i+1);
     const wd = ['CN','T2','T3','T4','T5','T6','T7'][d.getDay()];
-    return `<th class="db-day-th">${String(i+1).padStart(2,'0')}<br><span>${wd}</span></th>`;
+    const dateKey = `${monthGrid.year}-${String(monthGrid.month + 1).padStart(2,'0')}-${String(i + 1).padStart(2,'0')}`;
+    const active = dateKey === selectedDate;
+    return `<th class="db-day-th"><button class="btn-ghost" onclick="selectDashboardDate('${dateKey}')" style="width:100%;padding:6px 2px;border:${active ? '1px solid rgba(255,197,128,.55)' : '1px solid transparent'};background:${active ? 'rgba(255,153,51,.18)' : 'transparent'};border-radius:8px;color:${active ? 'var(--brand)' : 'inherit'}">${String(i+1).padStart(2,'0')}<br><span>${wd}</span></button></th>`;
   }).join('');
 
   // Build month grid rows from real data
@@ -139,6 +249,19 @@ function buildDashboard() {
       models: Array.from(new Set(items.map((item) => String(item.model_label || item.model_id || '-')).filter(Boolean))).join(', ') || '-',
     };
   });
+  const effectSummaryMap = new Map();
+  scopedItems.forEach((item) => {
+    if (String(item.type || '').toLowerCase() !== 'video') return;
+    const key = String(item.effectGroup || item.effect_group || 'custom').trim().toLowerCase() || 'custom';
+    const customText = String(item.effectGroupDetail || item.effect_group_detail || '').trim();
+    const groupKey = key === 'custom' && customText ? `custom::${customText.toLowerCase()}` : key;
+    const label = key === 'custom' && customText ? customText : getEffectGroupLabel(key);
+    const row = effectSummaryMap.get(groupKey) || { key: groupKey, label, tasks: 0, credits: 0 };
+    row.tasks += 1;
+    row.credits += Number(item.credit_used || item.credits || 0);
+    effectSummaryMap.set(groupKey, row);
+  });
+  const effectSummary = Array.from(effectSummaryMap.values()).sort((a, b) => b.tasks - a.tasks || a.label.localeCompare(b.label));
 
   // Helper to render period card
   function periodCard(title, color, period) {
@@ -228,6 +351,20 @@ function buildDashboard() {
       </table>
     </div>
 
+    <div class="db-section">
+      <div class="db-section-header">
+        <span class="db-section-title"><i class="fa-solid fa-wand-magic-sparkles" style="color:var(--brand)"></i> Nh\u00f3m hi\u1ec7u \u1ee9ng video</span>
+      </div>
+      <table class="db-table">
+        <thead><tr><th>Nh\u00f3m</th><th>Tasks</th><th>Credits/Cost</th></tr></thead>
+        <tbody>
+          ${effectSummary.length === 0
+            ? '<tr><td colspan="3" style="text-align:center;color:var(--muted);padding:12px">Ch\u01b0a c\u00f3 d\u1eef li\u1ec7u</td></tr>'
+            : effectSummary.map((row) => `<tr><td><b>${row.label}</b></td><td>${row.tasks}</td><td style="color:var(--yellow)">${Number.isInteger(row.credits) ? row.credits : row.credits.toFixed(2)}</td></tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+
     <!-- B?NG TH\u00C1NG -->
     <div class="db-section">
       <div class="db-section-header">
@@ -294,7 +431,7 @@ function buildDashboard() {
                 : [{ code: String(s.current_code || s.codeTag || '').trim(), task: String(s.current_task || s.effect || s.description || '').trim() }];
               return entries.map((entry, entryIdx) => `
               <tr>
-                <td>${entryIdx === 0 ? s.id : ''}</td><td>${st.name}</td><td>${String(entry.code || s.current_code || s.codeTag || '').trim() || '-'}</td><td>${String(entry.task || s.current_task || s.effect || s.description || '').trim() || '-'}</td>
+                <td>${entryIdx === 0 ? s.id : ''}</td><td>${st.name}</td><td>${String(entry.code || s.current_code || s.codeTag || '').trim() || '-'}</td><td>${String(entry.effect_group || '').trim() || String(entry.task || s.current_task || s.effect || s.description || '').trim() || '-'}</td>
                 <td style="font-size:11px">${startStr}</td>
                 <td><span class="db-status-tag active">active</span></td>
               </tr>`);
@@ -303,6 +440,8 @@ function buildDashboard() {
         </table>
       </div>
     </div>
+
+    ${buildDashboardDayDetailCard(selectedDate, { items: baseItems, reports: shiftReport })}
 
     <div class="db-grid-2">
       <!-- H\u00E0ng ch\u1EDD QC -->
@@ -393,12 +532,14 @@ function buildDashboard() {
 function buildStaffDashboard() {
   const el = document.getElementById('dashboardContent');
   if (!el) return;
+  const viewProfile = (typeof getViewProfile === 'function') ? getViewProfile() : (AppData.currentUser || {});
   const now = new Date();
   const selectedDate = staffShiftSelectedDate || `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
   const templates = getShiftTemplates();
   const active = AppData.activeShift;
   const summary = AppData.activeShiftSummary?.summary || {};
   const workTasks = Array.isArray(AppData.activeShiftSummary?.work_tasks) ? AppData.activeShiftSummary.work_tasks : [];
+  const scopedUsername = String(viewProfile.username || AppData.currentUser?.username || '').trim();
   const [selectedYear, selectedMonth] = String(selectedDate).split('-').map((v) => Number(v));
   const year = selectedYear || now.getFullYear();
   const month = Number.isFinite(selectedMonth) ? selectedMonth - 1 : now.getMonth();
@@ -532,11 +673,38 @@ function buildStaffDashboard() {
         `}
       </div>
     </div>
+    <div class="card" style="margin-top:16px">
+      <div class="card-header">
+        <div class="card-title"><i class="fa-solid fa-chart-line"></i> Chi tiết ngày ${selectedDate}</div>
+        <span class="badge badge-orange">${daySummary.totalMedia} media</span>
+      </div>
+      <div class="grid-4" style="gap:12px;margin-bottom:12px">
+        <div class="stat-card"><div class="stat-value">${daySummary.video}</div><div class="stat-label">Video</div></div>
+        <div class="stat-card"><div class="stat-value">${daySummary.image}</div><div class="stat-label">Ảnh</div></div>
+        <div class="stat-card"><div class="stat-value">${daySummary.pendingQc}</div><div class="stat-label">Chờ QC</div></div>
+        <div class="stat-card"><div class="stat-value">${daySummary.credits}</div><div class="stat-label">Credits</div></div>
+      </div>
+      <div class="table-wrapper">
+        <table>
+          <thead><tr><th>Media</th><th>CODE</th><th>Nhóm effect</th><th>Trạng thái</th><th>Credits</th><th>Tạo lúc</th></tr></thead>
+          <tbody>
+            ${dayLibrary.length === 0
+              ? '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:14px">Không có dữ liệu ngày này</td></tr>'
+              : dayLibrary.map((item) => `<tr><td>${item.name || '-'}</td><td>${item.codeTag || '-'}</td><td>${getEffectGroupLabel(item.effectGroup || item.effect_group || 'none')}</td><td>${item.status || '-'}</td><td style="color:var(--yellow)">${Number(item.credits || item.credit_used || 0)}</td><td>${item.createdAt || '-'}</td></tr>`).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
   `;
 }
 
 function selectStaffShiftDate(dateKey) {
   staffShiftSelectedDate = String(dateKey || '').trim();
+  buildDashboard();
+}
+
+function selectDashboardDate(dateKey) {
+  dashboardSelectedDate = String(dateKey || '').trim();
   buildDashboard();
 }
 
@@ -666,33 +834,85 @@ function buildLeaderboard() {
 // ---- QC MANAGER SCREEN ----
 function buildQC() {
   const el = document.getElementById('qcContent');
-  const queue = filterQCQueue({ staffId: qcStaffFilter });
+  const fullQueue = filterQCQueue(qcFilters);
+  const queue = fullQueue.slice(0, Math.max(1, Number(qcFilters.limit || 20)));
   const allApproved = AppData.library.filter(i => i.status === 'approved');
   const allRejected = AppData.library.filter(i => i.status === 'rejected');
   const totalQC = allApproved.length + allRejected.length;
   const passRate = totalQC > 0 ? ((allApproved.length / totalQC) * 100).toFixed(1) : '100';
-  const canConfigShift = ['admin', 'qc_manager'].includes(String(AppData.currentUser?.role || '').toLowerCase());
+  const canConfigShift = String(AppData.currentUser?.role || '').toLowerCase() === 'admin';
   const shiftConfigCard = canConfigShift ? buildQCShiftConfigCard() : '';
+  const qcItems = Array.isArray(AppData.qcQueue) ? AppData.qcQueue : [];
+  const qcStaffOptions = AppData.staff.filter((s) => String(s.role || '').trim().toLowerCase() === 'staff');
+  const qcDateOptions = Array.from(new Set(qcItems.map((item) => {
+    const submittedAt = Number(item.submittedAt || 0);
+    return submittedAt ? new Date(submittedAt * 1000).toISOString().slice(0, 10) : '';
+  }).filter(Boolean))).sort().reverse();
+  const qcEffectOptions = Array.from(new Set(qcItems.map((item) => String(item.effectGroup || '').trim().toLowerCase()).filter(Boolean))).sort();
+  const qcAssignedOptions = Array.from(new Set(qcItems
+    .filter((item) => String(item.assignedQcUser || '').trim() && String(item.assignedQcUser || '').trim() !== '__telegram__')
+    .filter((item) => {
+      const assigned = String(item.assignedQcUser || '').trim();
+      const user = AppData.staff.find((s) => String(s.username || '').trim() === assigned || String(s.id || '').trim() === assigned);
+      return String(user?.role || '').trim().toLowerCase() === 'qc_manager';
+    })
+    .map((item) => String(item.assignedQcUser || '').trim()))).sort();
   const onlineStaff = getActiveSessions().filter((row) => {
     const role = String(row.role || '').toLowerCase();
     if (role !== 'staff') return false;
-    if (qcStaffFilter && !isSameStaffRef(row.staffId || row.username || '', qcStaffFilter)) return false;
+    if (qcFilters.staffId && !isSameStaffRef(row.staffId || row.username || '', qcFilters.staffId)) return false;
     return true;
   });
 
   // First item for preview
-  const previewItem = queue.length > 0 ? queue[0] : null;
+  const previewItem = queue.find((item) => item.id === selectedQCItemId) || (queue.length > 0 ? queue[0] : null);
   const previewStaff = previewItem ? getStaff(previewItem.staffId) : null;
+  if (previewItem && selectedQCItemId !== previewItem.id) selectedQCItemId = previewItem.id;
+  function formatQueueAge(item) {
+    const submittedAt = Number(item?.submittedAt || 0);
+    if (!submittedAt) return '-';
+    const diff = Math.max(0, Math.floor(Date.now() / 1000) - submittedAt);
+    if (diff < 60) return `${diff}s`;
+    if (diff < 3600) return `${Math.floor(diff / 60)}m`;
+    return `${Math.floor(diff / 3600)}h`;
+  }
+  function formatClaimRemaining(item) {
+    const claimedAt = Number(item?.claimedAt || 0);
+    if (!claimedAt) return '';
+    const left = Math.max(0, 180 - (Math.floor(Date.now() / 1000) - claimedAt));
+    return `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`;
+  }
+  const currentQcUsername = String(AppData.currentUser?.username || '').trim();
 
   el.innerHTML = `
     <div class="section-header">
       <div class="section-title"><i class="fa-solid fa-check-double"></i> QC Manager Dashboard</div>
       <div style="display:flex;gap:8px">
-        <select class="form-select" style="width:auto;font-size:12px" onchange="setQCStaffFilter(this.value)">
+        <button class="btn-secondary btn-sm" onclick="refreshQCQueue()"><i class="fa-solid fa-rotate"></i> Refresh QC</button>
+        <select class="form-select" style="width:auto;font-size:12px" onchange="setQCFilter('staffId', this.value)">
           <option>T\u1EA5t c\u1EA3 Staff</option>
-          ${AppData.staff.map(s => `<option value="${s.id}" ${String(qcStaffFilter) === String(s.id) ? 'selected' : ''}>${s.name}</option>`).join('')}
+          ${qcStaffOptions.map(s => `<option value="${s.id}" ${String(qcFilters.staffId) === String(s.id) ? 'selected' : ''}>${s.name}</option>`).join('')}
         </select>
-        <button class="btn-secondary btn-sm"><i class="fab fa-telegram"></i> Nh\u1EADn Telegram Alert</button>
+        <select class="form-select" style="width:auto;font-size:12px" onchange="setQCFilter('date', this.value)">
+          <option value="">T\u1EA5t c\u1EA3 ng\u00E0y</option>
+          ${qcDateOptions.map((value) => `<option value="${value}" ${String(qcFilters.date) === value ? 'selected' : ''}>${value}</option>`).join('')}
+        </select>
+        <select class="form-select" style="width:auto;font-size:12px" onchange="setQCFilter('effect', this.value)">
+          <option value="">T\u1EA5t c\u1EA3 effect</option>
+          ${qcEffectOptions.map((value) => `<option value="${value}" ${String(qcFilters.effect) === value ? 'selected' : ''}>${getEffectGroupLabel(value)}</option>`).join('')}
+        </select>
+        <select class="form-select" style="width:auto;font-size:12px" onchange="setQCFilter('assigned', this.value)">
+          <option value="">T\u1EA5t c\u1EA3 QC</option>
+          <option value="__free__" ${String(qcFilters.assigned) === '__free__' ? 'selected' : ''}>QC tự do</option>
+          ${qcAssignedOptions.map((value) => `<option value="${value}" ${String(qcFilters.assigned) === value ? 'selected' : ''}>${qcItems.find((item) => String(item.assignedQcUser || '').trim() === value)?.assignedQcDisplay || value}</option>`).join('')}
+        </select>
+        <select class="form-select" style="width:auto;font-size:12px" onchange="setQCFilter('status', this.value)">
+          <option value="pending" ${String(qcFilters.status) === 'pending' ? 'selected' : ''}>Pending</option>
+          <option value="approved" ${String(qcFilters.status) === 'approved' ? 'selected' : ''}>Approved</option>
+          <option value="rejected" ${String(qcFilters.status) === 'rejected' ? 'selected' : ''}>Rejected</option>
+          <option value="" ${String(qcFilters.status) === '' ? 'selected' : ''}>T\u1EA5t c\u1EA3</option>
+        </select>
+        <button class="btn-secondary btn-sm" onclick="resetQCFilters()"><i class="fa-solid fa-filter-circle-xmark"></i> Reset</button>
       </div>
     </div>
     <div class="grid-4" style="margin-bottom:20px">
@@ -749,39 +969,56 @@ function buildQC() {
           ${queue.length === 0 ? '<div style="padding:20px;text-align:center;color:var(--muted)">Kh\u00F4ng c\u00F3 m\u1EE5c ch\u1EDD duy\u1EC7t</div>' : queue.map((item, idx) => {
             const st = getStaff(item.staffId);
             return `
-            <div class="output-card" onclick="selectQCItem(this, '${item.name}')" style="${idx===0 ? 'border-color:var(--brand);background:var(--brand-dim);' : ''}cursor:pointer">
+            <div class="output-card" onclick="selectQCItem(this, '${item.id}')" style="${previewItem && previewItem.id === item.id ? 'border-color:var(--brand);background:var(--brand-dim);' : ''}cursor:pointer">
               <div class="output-thumb"><i class="fa-solid ${item.type==='video'?'fa-film':'fa-image'}" style="color:${item.type==='video'?'var(--brand)':'var(--blue)'}"></i></div>
               <div style="flex:1;min-width:0">
-                <div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${item.name}</div>
-                <div style="font-size:11px;color:var(--muted);margin-top:2px">${st.name} \u00B7 ${item.codeTag}</div>
+                <div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${item.codeTag || item.taskId}</div>
+                <div style="font-size:11px;color:var(--muted);margin-top:2px">${st.name} \u00B7 Task #${Math.max(1, Number(item.taskIndex || 0) + 1)}</div>
+                <div style="font-size:11px;color:var(--muted2);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${item.effectGroupDetail || getEffectGroupLabel(item.effectGroup) || '-- None --'}</div>
                 <div style="margin-top:4px">
-                  <span class="badge badge-yellow" style="font-size:10px"><i class="fa-solid fa-clock"></i> Ch\u1EDD duy\u1EC7t</span>
-                  <span style="font-size:10px;color:var(--yellow);margin-left:6px">${item.credits} cr</span>
+                  <span class="badge badge-yellow" style="font-size:10px"><i class="fa-solid fa-clock"></i> ${item.submittedAtText}</span>
+                  <span class="badge badge-blue" style="font-size:10px;margin-left:6px">Age ${formatQueueAge(item)}</span>
+                  <span style="font-size:10px;color:var(--yellow);margin-left:6px">${Number(item.creditUsed || 0)} cr</span>
+                </div>
+                <div style="margin-top:4px;display:flex;gap:6px;flex-wrap:wrap">
+                  ${item.assignedQcDisplay ? `<span class="badge badge-green" style="font-size:10px">Giao ${item.assignedQcDisplay}</span>` : `<span class="badge badge-blue" style="font-size:10px">QC tự do</span>`}
+                  ${item.claimedDisplay ? `<span class="badge badge-orange" style="font-size:10px">Đang giữ: ${item.claimedDisplay}${formatClaimRemaining(item) ? ` · ${formatClaimRemaining(item)}` : ''}</span>` : ''}
                 </div>
               </div>
             </div>`;
           }).join('')}
         </div>
+        ${fullQueue.length > queue.length ? `<div style="margin-top:10px;display:flex;justify-content:center"><button class="btn-secondary btn-sm" onclick="loadMoreQCQueue()">Load more (${fullQueue.length - queue.length} còn lại)</button></div>` : ''}
       </div>
       <div class="card">
         <div class="card-header">
           <div class="card-title"><i class="fa-solid fa-eye"></i> Preview</div>
-          <span class="badge badge-orange" id="previewName">${previewItem ? previewItem.name : 'N/A'}</span>
+          <span class="badge badge-orange" id="previewName">${previewItem ? (previewItem.codeTag || previewItem.taskId) : 'N/A'}</span>
         </div>
-        <div style="width:100%;aspect-ratio:16/9;background:var(--bg2);border-radius:8px;display:flex;align-items:center;justify-content:center;margin-bottom:12px;border:1px solid var(--border)">
-          <div style="text-align:center;color:var(--muted)">
-            <i class="fa-solid fa-play-circle" style="font-size:48px;display:block;margin-bottom:8px;color:var(--brand)"></i>
-            <div style="font-size:13px">${previewItem ? previewItem.name : 'Ch\u1EDDn item d? preview'}</div>
-            <div style="font-size:11px;color:var(--muted2)">Model: ${AppData.model.name}</div>
-          </div>
+        <div style="width:100%;aspect-ratio:16/9;background:var(--bg2);border-radius:8px;display:flex;align-items:center;justify-content:center;margin-bottom:12px;border:1px solid var(--border);overflow:hidden">
+          ${previewItem
+            ? (String(previewItem.type || 'video').toLowerCase() === 'image'
+              ? (previewItem.resultUrl
+                ? `<img src="${previewItem.resultUrl}" alt="${previewItem.codeTag || previewItem.taskId}" style="width:100%;height:100%;object-fit:contain;display:block;background:#111">`
+                : `<div style="text-align:center;color:var(--muted)"><i class="fa-solid fa-image" style="font-size:48px;display:block;margin-bottom:8px;color:var(--blue)"></i><div style="font-size:13px">${previewItem.codeTag || previewItem.taskId}</div><div style="font-size:11px;color:var(--muted2)">Ch\u01B0a c\u00F3 media</div></div>`)
+              : (previewItem.resultUrl
+                ? `<video src="${previewItem.resultUrl}" poster="${previewItem.coverUrl || ''}" controls autoplay playsinline preload="metadata" style="width:100%;height:100%;object-fit:contain;display:block;background:#111"></video>`
+                : `<div style="text-align:center;color:var(--muted)"><i class="fa-solid fa-play-circle" style="font-size:48px;display:block;margin-bottom:8px;color:var(--brand)"></i><div style="font-size:13px">${previewItem.codeTag || previewItem.taskId}</div><div style="font-size:11px;color:var(--muted2)">Ch\u01B0a c\u00F3 media</div></div>`))
+            : `<div style="text-align:center;color:var(--muted)"><i class="fa-solid fa-play-circle" style="font-size:48px;display:block;margin-bottom:8px;color:var(--brand)"></i><div style="font-size:13px">Ch\u1ECDn item \u0111\u1EC3 preview</div></div>`}
         </div>
         <div style="padding:12px;background:var(--bg2);border-radius:8px;margin-bottom:12px">
           <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Th\u00F4ng tin s\u1EA3n ph\u1EA9m</div>
           ${previewItem ? [
             ['Staff', previewStaff ? previewStaff.name : 'N/A'],
-            ['Model', AppData.model.name],
-            ['Credits', previewItem.credits + ' cr'],
-            ['CODE', previewItem.codeTag]
+            ['Model', previewItem.modelId || AppData.model.id],
+            ['Credits', Number(previewItem.creditUsed || 0) + ' cr'],
+            ['CODE', previewItem.codeTag],
+            ['Task #', String(Math.max(1, Number(previewItem.taskIndex || 0) + 1))],
+            ['Task ID', previewItem.taskId || '-'],
+            ['Effect', previewItem.effectGroupDetail || getEffectGroupLabel(previewItem.effectGroup)],
+            ['G\u1EEDi l\u00FAc', previewItem.submittedAtText],
+            ['QC được giao', previewItem.assignedQcDisplay || 'QC tự do'],
+            ['QC đang giữ', previewItem.claimedDisplay ? `${previewItem.claimedDisplay}${formatClaimRemaining(previewItem) ? ` · ${formatClaimRemaining(previewItem)}` : ''}` : '-']
           ].map(r => `
             <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px">
               <span style="color:var(--muted)">${r[0]}</span><span${r[0]==='Credits'?' style="color:var(--yellow)"':''}>${r[1]}</span>
@@ -793,9 +1030,9 @@ function buildQC() {
           <textarea class="form-textarea" placeholder="G\u00F3p \u00FD v\u1EC1 ch\u1EA5t l\u01B0\u1EE3ng video..." style="height:60px" id="qcComment"></textarea>
         </div>
         <div style="display:flex;gap:8px">
+          ${previewItem && previewItem.claimedBy && previewItem.claimedBy === currentQcUsername ? `<button class="btn-secondary" style="flex:1" onclick="releaseQCClaim()"><i class="fa-solid fa-unlock"></i> Nhả task</button>` : ''}
           <button class="btn-success" style="flex:1" onclick="approveItem()"><i class="fa-solid fa-check"></i> Approve</button>
           <button class="btn-danger" style="flex:1" onclick="rejectItem()"><i class="fa-solid fa-xmark"></i> Reject</button>
-          <button class="btn-ghost btn-sm" onclick="sendTelegramReview()"><i class="fab fa-telegram"></i></button>
         </div>
       </div>
     </div>
@@ -876,6 +1113,10 @@ async function saveShiftConfigFromQC() {
 // ---- HR & KPI SCREEN ----
 function buildHR() {
   const el = document.getElementById('hrContent');
+  if (typeof canAccessScreen === 'function' && !canAccessScreen('hr')) {
+    el.innerHTML = `<div class="card"><div class="card-title">Admin only</div><div style="color:var(--muted);font-size:13px">Ban khong co quyen truy cap man hinh nay.</div></div>`;
+    return;
+  }
   el.innerHTML = `
     <div class="section-header">
       <div class="section-title"><i class="fa-solid fa-users"></i> HR & KPI Management</div>
@@ -903,6 +1144,15 @@ function setDashboardView(mode, btn) {
 
 function setDashboardFilter(field, value) {
   dashboardFilters[field] = String(value || '').trim();
+  if (field === 'month') {
+    const key = String(dashboardFilters.month || '').trim();
+    if (/^\d{4}-\d{2}$/.test(key)) {
+      const [year, month] = key.split('-').map((v) => Number(v));
+      dashboardSelectedDate = getDashboardSelectedDateForMonth(year, month - 1);
+    } else {
+      dashboardSelectedDate = '';
+    }
+  }
   dashboardViewMode =
     field === 'period' ? dashboardFilters.period :
     field === 'group' && dashboardFilters.group ? 'groups' :
@@ -915,6 +1165,158 @@ function setDashboardFilter(field, value) {
 function refreshDashboardView() {
   buildDashboard();
   if (typeof showToast === 'function') showToast('\u0110\u00E3 l\u00E0m m\u1EDBi Dashboard', 'success');
+}
+
+function buildStaffDashboard() {
+  const el = document.getElementById('dashboardContent');
+  if (!el) return;
+  const viewProfile = (typeof getViewProfile === 'function') ? getViewProfile() : (AppData.currentUser || {});
+  const now = new Date();
+  const selectedDate = staffShiftSelectedDate || `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const templates = getShiftTemplates();
+  const active = AppData.activeShift;
+  const summary = AppData.activeShiftSummary?.summary || {};
+  const workTasks = Array.isArray(AppData.activeShiftSummary?.work_tasks) ? AppData.activeShiftSummary.work_tasks : [];
+  const scopedUsername = String(viewProfile.username || AppData.currentUser?.username || '').trim();
+  const [selectedYear, selectedMonth] = String(selectedDate).split('-').map((v) => Number(v));
+  const year = selectedYear || now.getFullYear();
+  const month = Number.isFinite(selectedMonth) ? selectedMonth - 1 : now.getMonth();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const firstDay = new Date(year, month, 1).getDay();
+  const monthLabel = `Th\u00E1ng ${String(month + 1).padStart(2, '0')}/${year}`;
+  const monthOptions = Array.from({ length: 12 }, (_, idx) => {
+    const dt = new Date(now.getFullYear(), now.getMonth() - idx, 1);
+    const value = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}`;
+    const label = `Th\u00E1ng ${String(dt.getMonth() + 1).padStart(2, '0')}/${dt.getFullYear()}`;
+    const isSelected = value === `${year}-${String(month + 1).padStart(2, '0')}`;
+    return `<option value="${value}" ${isSelected ? 'selected' : ''}>${label}</option>`;
+  }).join('');
+  let cells = '';
+  for (let i = 0; i < firstDay; i++) cells += '<div></div>';
+  for (let day = 1; day <= daysInMonth; day++) {
+    const dateKey = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    const isSelected = dateKey === selectedDate;
+    const isToday = dateKey === `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const dayBorder = isSelected
+      ? '1px solid #ffd8aa'
+      : (isToday ? '1px solid #ffc178' : '1px solid #d7863f');
+    const dayBackground = isSelected
+      ? 'linear-gradient(155deg, rgba(255,204,143,.72) 0%, rgba(255,165,77,.52) 45%, rgba(93,45,14,.94) 100%)'
+      : (isToday
+        ? 'linear-gradient(155deg, rgba(255,191,118,.58) 0%, rgba(255,150,60,.40) 45%, rgba(82,39,12,.95) 100%)'
+        : 'linear-gradient(155deg, rgba(255,172,92,.42) 0%, rgba(215,116,42,.28) 48%, rgba(64,32,15,.96) 100%)');
+    const dayShadow = isSelected
+      ? '0 0 0 1px rgba(255,214,162,.28) inset, 0 14px 26px rgba(0,0,0,.30)'
+      : (isToday
+        ? '0 0 0 1px rgba(255,193,122,.24) inset, 0 10px 20px rgba(0,0,0,.26)'
+        : '0 8px 16px rgba(0,0,0,.20)');
+    cells += `<button class="btn-ghost" onclick="selectStaffShiftDate('${dateKey}')" style="height:72px;border:${dayBorder};background:${dayBackground};box-shadow:${dayShadow};color:${isToday ? 'var(--green)' : 'var(--text)'};border-radius:12px;text-align:left;padding:10px">
+      <div style="font-size:16px;font-weight:800">${String(day).padStart(2, '0')}</div>
+      <div style="font-size:11px;color:var(--muted)">${dateKey}</div>
+    </button>`;
+  }
+  el.innerHTML = `
+    <div class="section-header">
+      <div class="section-title"><i class="fa-solid fa-calendar-days"></i> Dashboard ca l\u00E0m vi\u1EC7c</div>
+    </div>
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><i class="fa-solid fa-calendar"></i> L\u1ECBch l\u00E0m vi\u1EC7c</div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <select class="form-select" style="width:auto;font-size:12px" onchange="selectStaffShiftMonth(this.value)">
+              ${monthOptions}
+            </select>
+            <span class="badge badge-blue">${monthLabel}</span>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px">
+          ${['CN', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7'].map((d) => `<div style="font-size:12px;color:var(--muted);font-weight:700;text-align:center">${d}</div>`).join('')}
+          ${cells}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title"><i class="fa-solid fa-business-time"></i> ${active ? 'Ca \u0111ang m\u1EDF' : 'B\u1EAFt \u0111\u1EA7u ca'}</div>
+          <span class="badge ${active ? 'badge-green' : 'badge-yellow'}">${active ? 'active' : 'ready'}</span>
+        </div>
+        ${active ? `
+          <div style="display:flex;flex-direction:column;gap:10px">
+            <div style="padding:12px;background:var(--bg2);border:1px solid var(--border);border-radius:10px">
+              <div style="font-size:15px;font-weight:800">${active.shiftLabel || active.title || 'Ca l\u00E0m vi\u1EC7c'}</div>
+              <div style="font-size:12px;color:var(--muted);margin-top:6px">Ng\u00E0y: ${active.shiftDate || '-'}</div>
+              <div style="font-size:12px;color:var(--muted)">B\u1EAFt \u0111\u1EA7u: ${(() => { const dt = parseRuntimeDate(active.createdAt); return dt ? dt.toLocaleString('vi-VN') : '-'; })()}</div>
+              <div style="font-size:12px;color:var(--muted)">Khung gi\u1EDD: ${active.plannedStart || '-'} - ${active.plannedEnd || '-'}</div>
+            </div>
+            <div class="grid-3" style="gap:12px">
+              <div class="stat-card"><div class="stat-value">${Number(summary.work_task_count || 0)}</div><div class="stat-label">S\u1ED1 phi\u00EAn task</div></div>
+              <div class="stat-card"><div class="stat-value">${Number(summary.total_tasks || 0)}</div><div class="stat-label">T\u1ED5ng task</div></div>
+              <div class="stat-card"><div class="stat-value">${Number(summary.total_credits || 0)}</div><div class="stat-label">Credits ti\u00EAu th\u1EE5</div></div>
+            </div>
+            <div class="card" style="padding:0;border:none;background:transparent">
+              <div class="table-wrapper">
+                <table>
+                  <thead><tr><th>#</th><th>Phi\u00EAn task</th><th>Video</th><th>Credits</th></tr></thead>
+                  <tbody>
+                    ${workTasks.length === 0
+                      ? '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:14px">Ch\u01B0a c\u00F3 phi\u00EAn task</td></tr>'
+                      : workTasks.map((row, idx) => `<tr><td>${idx + 1}</td><td>${row.title || '-'}</td><td>${Number(row.video_count || 0)}</td><td style="color:var(--yellow)">${Number(row.credits_used || 0)}</td></tr>`).join('')}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>Ghi ch\u00FA k\u1EBFt th\u00FAc</label>
+              <textarea id="shiftCloseNote" class="form-textarea" placeholder="Nh\u1EADp ghi ch\u00FA k\u1EBFt ca..."></textarea>
+            </div>
+            <div class="form-group">
+              <label>\u0110\u00E1nh gi\u00E1 ca</label>
+              <select id="shiftCloseRating" class="form-select">
+                <option value="T\u1ED1t">T\u1ED1t</option>
+                <option value="Kh\u00E1">Kh\u00E1</option>
+                <option value="C\u1EA7n c\u1EA3i thi\u1EC7n">C\u1EA7n c\u1EA3i thi\u1EC7n</option>
+              </select>
+            </div>
+            <div style="display:flex;gap:10px;flex-wrap:wrap">
+              <button class="btn-secondary" onclick="submitShiftReportOnly()"><i class="fa-solid fa-paper-plane"></i> G\u1EEDi b\u00E1o c\u00E1o</button>
+              <button class="btn-danger" onclick="closeActiveShiftOnly()" title="${AppData.activeShiftReportSubmitted ? 'K\u1EBFt th\u00FAc ca' : 'Ph\u1EA3i g\u1EEDi b\u00E1o c\u00E1o tr\u01B0\u1EDBc khi k\u1EBFt th\u00FAc ca'}"><i class="fa-solid fa-stop"></i> K\u1EBFt th\u00FAc ca</button>
+              <button class="btn-primary" onclick="openCreatorFromActiveShift()"><i class="fa-solid fa-arrow-right"></i> V\u00E0o Creator Workspace</button>
+            </div>
+            ${AppData.activeShiftReportSubmitted ? '' : '<div style="font-size:12px;color:var(--yellow);font-weight:600">Ph\u1EA3i g\u1EEDi b\u00E1o c\u00E1o tr\u01B0\u1EDBc khi nh\u1EA5n K\u1EBFt th\u00FAc ca</div>'}
+          </div>
+        ` : `
+          <div style="display:flex;flex-direction:column;gap:12px">
+            <div class="form-group">
+              <label>Nh\u00E2n s\u1EF1</label>
+              <input class="form-input" value="${viewProfile.name || '-'}" disabled>
+            </div>
+            <div class="form-group">
+              <label>Ng\u00E0y l\u00E0m vi\u1EC7c</label>
+              <input class="form-input" value="${selectedDate}" disabled>
+            </div>
+            <div class="form-group">
+              <label>T\u00EAn ca</label>
+              <select id="staffShiftTemplate" class="form-select">
+                <option value="morning">${templates.morning.label} (${templates.morning.start} - ${templates.morning.end})</option>
+                <option value="afternoon">${templates.afternoon.label} (${templates.afternoon.start} - ${templates.afternoon.end})</option>
+                <option value="evening">${templates.evening.label} (${templates.evening.start} - ${templates.evening.end})</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Ghi ch\u00FA b\u1EAFt \u0111\u1EA7u</label>
+              <textarea id="shiftStartNote" class="form-textarea" placeholder="Nh\u1EADp k\u1EBF ho\u1EA1ch ca l\u00E0m..."></textarea>
+            </div>
+            <button class="btn-primary" onclick="beginShiftForSelectedDate()"><i class="fa-solid fa-play"></i> B\u1EAFt \u0111\u1EA7u ca</button>
+          </div>
+        `}
+      </div>
+    </div>
+    ${buildDashboardDayDetailCard(selectedDate, {
+      items: Array.isArray(AppData.library) ? AppData.library : [],
+      reports: Array.isArray(AppData.shiftReports) ? AppData.shiftReports : [],
+      scopedUsername,
+    })}
+  `;
 }
 
 function resetDashboardLayout() {
@@ -1286,6 +1688,9 @@ function buildLibrary() {
   const el = document.getElementById('libraryContent');
   if (!el) return;
   const codeOptions = Array.from(new Set((AppData.library || []).map((item) => String(item.codeTag || '').trim()).filter(Boolean))).sort();
+  const effectOptions = Array.from(new Set((AppData.library || [])
+    .map((item) => String(item.effectGroup || item.effect_group || '').trim().toLowerCase())
+    .filter(Boolean))).sort();
   const filteredItems = filterLibraryItems(libraryFilters);
   const visibleItems = filteredItems.slice(0, libraryFilters.limit);
 
@@ -1299,6 +1704,7 @@ function buildLibrary() {
         </select>
         <select class="form-select" style="width:auto;font-size:12px" onchange="setLibraryFilter('type', this.value)"><option value="">T\u1EA5t c\u1EA3 lo\u1EA1i</option><option value="video" ${libraryFilters.type === 'video' ? 'selected' : ''}>Video</option><option value="image" ${libraryFilters.type === 'image' ? 'selected' : ''}>\u1EA2nh</option></select>
         <select class="form-select" style="width:auto;font-size:12px" onchange="setLibraryFilter('status', this.value)"><option value="">T\u1EA5t c\u1EA3 tr\u1EA1ng th\u00E1i</option><option value="approved" ${libraryFilters.status === 'approved' ? 'selected' : ''}>Approved</option><option value="pending_qc" ${libraryFilters.status === 'pending_qc' ? 'selected' : ''}>Pending</option><option value="rejected" ${libraryFilters.status === 'rejected' ? 'selected' : ''}>Rejected</option><option value="done" ${libraryFilters.status === 'done' ? 'selected' : ''}>Done</option><option value="processing" ${libraryFilters.status === 'processing' ? 'selected' : ''}>Processing</option></select>
+        <select class="form-select" style="width:auto;font-size:12px" onchange="setLibraryFilter('effect', this.value)"><option value="">T\u1EA5t c\u1EA3 nh\u00F3m effect</option>${effectOptions.map((effect) => `<option value="${effect}" ${libraryFilters.effect === effect ? 'selected' : ''}>${getEffectGroupLabel(effect)}</option>`).join('')}</select>
       </div>
     </div>
     <div class="grid-4" style="margin-bottom:16px">
@@ -1352,11 +1758,23 @@ async function submitLibraryQCById(itemId) {
     const res = await API.submitQC({
       task_id: item.taskId,
       video_url: item.resultUrl,
+      cover_url: item.coverUrl || '',
+      session_id: item.sessionId || '',
+      code_tag: item.codeTag || '',
+      task_index: Number(item.taskIndex || 0),
+      prompt: item.prompt || '',
+      effect_group: item.effectGroup || '',
+      effect_group_detail: item.effectGroupDetail || '',
+      provider: item.provider || '',
+      model_id: item.modelId || '',
+      gen_mode: item.genMode || item.mode || '',
+      duration: item.duration || '',
+      aspect_ratio: item.ratio || item.aspectRatio || '',
+      credit_used: Number(item.credits || 0),
       note: item.qcNote || '',
     });
     if (!res || !res.ok) throw new Error('Submit QC th\u1EA5t b\u1EA1i');
-    item.status = 'pending_qc';
-    item.qcStatus = 'pending_qc';
+    await loadDataFromAPI();
     buildLibrary();
     showToast(`\u0110\u00E3 g\u1EEDi QC: ${item.name || item.taskId}`, 'success');
   } catch (err) {
@@ -1365,7 +1783,23 @@ async function submitLibraryQCById(itemId) {
 }
 
 function setQCStaffFilter(staffId) {
-  qcStaffFilter = String(staffId || '').trim();
+  qcFilters.staffId = String(staffId || '').trim();
+  buildQC();
+}
+
+function setQCFilter(field, value) {
+  qcFilters[field] = String(value || '').trim();
+  if (field !== 'limit') qcFilters.limit = 20;
+  buildQC();
+}
+
+function resetQCFilters() {
+  qcFilters = { staffId: '', date: '', effect: '', assigned: '', status: 'pending', limit: 20 };
+  buildQC();
+}
+
+function loadMoreQCQueue() {
+  qcFilters.limit = Math.max(20, Number(qcFilters.limit || 20) + 20);
   buildQC();
 }
 
@@ -1383,6 +1817,10 @@ function loadMoreLibraryItems() {
 // ---- SETTINGS SCREEN ----
 function buildSettings() {
   const el = document.getElementById('settingsContent');
+  if (typeof canAccessScreen === 'function' && !canAccessScreen('settings')) {
+    el.innerHTML = `<div class="card"><div class="card-title">Admin only</div><div style="color:var(--muted);font-size:13px">Ban khong co quyen truy cap man hinh nay.</div></div>`;
+    return;
+  }
   const isAdmin = String(AppData.currentUser?.role || '').toLowerCase() === 'admin';
   el.innerHTML = `
     <div class="section-title" style="margin-bottom:20px"><i class="fa-solid fa-gear"></i> Settings & Configuration</div>
@@ -1411,14 +1849,25 @@ function buildSettings() {
             <input class="form-input" id="settingsP1ActiveIndex" type="number" min="0" value="0">
           </div>
           <div class="form-group">
-            <label>PiAPI P2 Key</label>
-            <input class="form-input" id="settingsP2Key" placeholder="pi_xxx" type="password">
+            <label>PiAPI P2 Keys (mỗi dòng 1 key)</label>
+            <textarea class="form-textarea" id="settingsP2Keys" style="height:96px;font-size:11px" placeholder="dán nhiều key, mỗi dòng 1 key"></textarea>
+          </div>
+          <div class="form-group">
+            <label>P2 active key index</label>
+            <input class="form-input" id="settingsP2ActiveIndex" type="number" min="0" value="0">
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap">
             <button class="btn-primary btn-sm" onclick="saveApiKeysSettings()"><i class="fa-solid fa-floppy-disk"></i> L\u01B0u keys</button>
             <button class="btn-secondary btn-sm" onclick="refreshApiKeysSettings()"><i class="fa-solid fa-rotate"></i> Refresh balances</button>
           </div>
           <div id="settingsKeysStatus" style="margin-top:10px;font-size:11px;color:var(--muted)">\u0110ang t\u1EA3i...</div>
+          <div style="margin-top:12px">
+            <div style="font-size:12px;font-weight:700;margin-bottom:8px"><i class="fa-solid fa-clock-rotate-left"></i> Lịch sử nạp/đổi key</div>
+            <div class="table-wrapper"><table>
+              <thead><tr><th>Thời gian</th><th>Người dùng</th><th>Action</th><th>Chi tiết</th></tr></thead>
+              <tbody id="settingsKeyHistoryBody">${renderKeyHistoryRows(20)}</tbody>
+            </table></div>
+          </div>
         </div>
       </div>
       <div style="display:flex;flex-direction:column;gap:16px">
@@ -1477,6 +1926,7 @@ function buildSettings() {
   `;
   loadTelegramSettings();
   loadApiKeysSettings();
+  loadSettingsKeyHistory(20);
   if (isAdmin) loadProviderSettings();
 }
 
@@ -1545,14 +1995,17 @@ async function testTelegramSettings() {
 
 async function loadApiKeysSettings() {
   const p1 = document.getElementById('settingsP1Keys');
-  const p2 = document.getElementById('settingsP2Key');
+  const p2 = document.getElementById('settingsP2Keys');
   const active = document.getElementById('settingsP1ActiveIndex');
+  const activeP2 = document.getElementById('settingsP2ActiveIndex');
   const status = document.getElementById('settingsKeysStatus');
-  if (!p1 || !p2 || !active || !status) return;
+  if (!p1 || !p2 || !active || !activeP2 || !status) return;
   try {
-    const [p1Res, p2Res] = await Promise.all([
+    const [p1Res, p2Res, p1BalRes, p2BalRes] = await Promise.all([
       API.getCreditKeys(),
       API.getProvider2Keys(),
+      API.getCreditBalance(),
+      API.getProviderCredits('provider2'),
     ]);
     const p1Count = (p1Res?.keys || []).length;
     const activeIdx = Math.max(0, (p1Res?.keys || []).findIndex((k) => !!k.active));
@@ -1562,39 +2015,141 @@ async function loadApiKeysSettings() {
     p1.placeholder = `\u0110ang c\u00F3 ${p1Count} key tr\u00EAn server. D\u00E1n FULL danh s\u00E1ch key m\u1EDBi, m\u1ED7i d\u00F2ng 1 key \u0111\u1EC3 replace.`;
     active.value = String(activeIdx);
     p2.value = '';
-    const p2Masked = p2Res?.keys?.[0]?.masked || 'Not set';
-    status.textContent = `P1: ${p1Count} key | P2: ${p2Masked}`;
+    const p2Keys = Array.isArray(p2Res?.keys) ? p2Res.keys : [];
+    const p2Count = p2Keys.length;
+    const p2ActiveIdxRaw = Number.isFinite(Number(p2Res?.active_index)) ? Number(p2Res.active_index) : p2Keys.findIndex((k) => !!k.active);
+    const p2ActiveIdx = p2ActiveIdxRaw >= 0 ? p2ActiveIdxRaw : 0;
+    activeP2.value = String(p2ActiveIdx);
+    const p2ActiveMasked = p2Keys.find((k) => !!k.active)?.masked || p2Keys[0]?.masked || 'Not set';
+    p2.placeholder = `Đang có ${p2Count} key P2 trên server. Dán FULL danh sách key mới, mỗi dòng 1 key để replace.`;
+    const p1Total = Number(p1BalRes?.credits || 0);
+    const p2Total = Number(
+      typeof p2BalRes?.total === 'number' ? p2BalRes.total
+        : (typeof p2BalRes?.balance === 'number' ? p2BalRes.balance : 0)
+    );
+    status.textContent = `P1: ${p1Count} key, ${p1Total.toFixed(2)} cr | P2: ${p2Count} key, $${p2Total.toFixed(2)} (active ${p2ActiveMasked})`;
   } catch (err) {
     status.textContent = 'Kh\u00F4ng t\u1EA3i \u0111\u01B0\u1EE3c key settings';
     if (typeof showToast === 'function') showToast(err.message || 'Load key settings th\u1EA5t b\u1EA1i', 'error');
   }
 }
 
+function renderKeyHistoryRows(limit = 20) {
+  const rows = (Array.isArray(settingsKeyHistoryCache) ? settingsKeyHistoryCache : [])
+    .sort((a, b) => String(b.timestamp || b.created_at || b.createdAt || '').localeCompare(String(a.timestamp || a.created_at || a.createdAt || '')))
+    .slice(0, Math.max(1, Number(limit) || 20));
+  if (!rows.length) {
+    return '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:10px">Chưa có lịch sử nạp/đổi key</td></tr>';
+  }
+  return rows.map((row) => `
+    <tr>
+      <td style="font-size:11px">${row.timestamp || row.created_at || row.createdAt || '-'}</td>
+      <td>${row.user_display || row.user_name || row.staff_id || '-'}</td>
+      <td>${row.action || row.action_raw || '-'}</td>
+      <td style="white-space:normal;max-width:340px">${row.detail || row.details || row.note || '-'}</td>
+    </tr>
+  `).join('');
+}
+
+function refreshSettingsKeyHistory(limit = 20) {
+  const body = document.getElementById('settingsKeyHistoryBody');
+  if (!body) return;
+  body.innerHTML = renderKeyHistoryRows(limit);
+}
+
+function getFallbackKeyHistoryRows(limit = 20) {
+  const rows = Array.isArray(AppData.activityHistory) ? AppData.activityHistory : [];
+  return rows
+    .filter((row) => {
+      const provider = String(row?.provider || '').trim().toLowerCase();
+      const action = String(row?.action_raw || row?.action || '').trim().toLowerCase();
+      const detail = String(row?.detail || row?.prompt || '').trim().toLowerCase();
+      return (
+        provider === 'key_management' ||
+        provider === 'credits_refresh' ||
+        provider.includes('key') ||
+        provider.includes('credit') ||
+        action.includes('key') ||
+        action.includes('refresh') ||
+        action.includes('credit') ||
+        action.includes('balance') ||
+        detail.includes('provider1 key') ||
+        detail.includes('provider2 key') ||
+        detail.includes('key') ||
+        detail.includes('balance') ||
+        detail.includes('credits refresh')
+      );
+    })
+    .map((row) => ({
+      timestamp: row.timestamp || row.created_at || row.createdAt || '',
+      user_display: row.user_display || row.user_name || row.staff_id || '',
+      user_name: row.user_name || row.user_display || row.staff_id || '',
+      action: row.action_raw || row.action || '',
+      detail: row.detail || row.prompt || '',
+      credits: row.credit_used || row.credits || 0,
+      provider: row.provider || '',
+    }))
+    .sort((a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')))
+    .slice(0, Math.max(1, Number(limit) || 20));
+}
+
+async function loadSettingsKeyHistory(limit = 20) {
+  try {
+    const rows = await API.getProviderKeyHistory(limit);
+    settingsKeyHistoryCache = Array.isArray(rows) && rows.length ? rows.slice() : getFallbackKeyHistoryRows(limit);
+  } catch (_) {
+    settingsKeyHistoryCache = getFallbackKeyHistoryRows(limit);
+  }
+  refreshSettingsKeyHistory(limit);
+}
+
 async function saveApiKeysSettings() {
   const p1 = document.getElementById('settingsP1Keys');
-  const p2 = document.getElementById('settingsP2Key');
+  const p2 = document.getElementById('settingsP2Keys');
   const active = document.getElementById('settingsP1ActiveIndex');
+  const activeP2 = document.getElementById('settingsP2ActiveIndex');
   const status = document.getElementById('settingsKeysStatus');
-  if (!p1 || !p2 || !active || !status) return;
+  if (!p1 || !p2 || !active || !activeP2 || !status) return;
   try {
     const p1Keys = String(p1.value || '')
       .split('\n')
       .map((s) => s.trim())
       .filter(Boolean);
     const activeIndex = Number(active.value || 0);
+    const p2Keys = String(p2.value || '')
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const activeIndexP2 = Number(activeP2.value || 0);
     if (p1Keys.length) {
-      await API.replaceCreditKeys(p1Keys, Number.isFinite(activeIndex) ? activeIndex : 0);
+      // P1: append mode (không ghi đè danh sách cũ)
+      for (const key of p1Keys) {
+        try {
+          await API.addCreditKey(key);
+        } catch (err) {
+          const msg = String(err?.message || '').toLowerCase();
+          if (!msg.includes('da ton tai') && !msg.includes('khong hop le')) throw err;
+        }
+      }
+      const p1Now = await API.getCreditKeys();
+      const keyCount = Array.isArray(p1Now?.keys) ? p1Now.keys.length : 0;
+      if (keyCount > 0) {
+        const safeIdx = Number.isFinite(activeIndex) && activeIndex >= 0 && activeIndex < keyCount ? activeIndex : 0;
+        await API.setActiveCreditKey(safeIdx);
+      }
     }
-    const p2Key = String(p2.value || '').trim();
-    if (p2Key) {
-      await API.setProvider2Key(p2Key);
+    if (p2Keys.length) {
+      const safeP2 = Number.isFinite(activeIndexP2) ? Math.max(0, activeIndexP2) : 0;
+      await API.replaceProvider2Keys(p2Keys, safeP2);
     }
-    if (!p1Keys.length && !p2Key) {
+    if (!p1Keys.length && !p2Keys.length) {
       throw new Error('Nh\u1EADp \u00EDt nh\u1EA5t 1 key Provider1 ho\u1EB7c Provider2');
     }
-    status.textContent = `\u0110\u00E3 l\u01B0u${p1Keys.length ? ` ${p1Keys.length} key Provider1` : ''}${p2Key ? ' + Provider2' : ''}`;
+    status.textContent = `\u0110\u00E3 l\u01B0u${p1Keys.length ? ` +${p1Keys.length} key Provider1` : ''}${p2Keys.length ? ` +${p2Keys.length} key Provider2` : ''}`;
     if (typeof showToast === 'function') showToast('L\u01B0u keys th\u00E0nh c\u00F4ng', 'success');
     await refreshSidebarCredits();
+    await loadDataFromAPI();
+    await loadSettingsKeyHistory(20);
     await loadApiKeysSettings();
   } catch (err) {
     if (typeof showToast === 'function') showToast(err.message || 'L\u01B0u keys th\u1EA5t b\u1EA1i', 'error');
@@ -1605,11 +2160,20 @@ async function refreshApiKeysSettings() {
   const status = document.getElementById('settingsKeysStatus');
   if (status) status.textContent = '\u0110ang refresh balances...';
   try {
-    const res = await API.refreshCredits();
-    const total = Number(res?.credits || 0);
-    if (status) status.textContent = `Credits total: ${total.toFixed(2)}`;
+    const [resP1, resP2] = await Promise.all([
+      API.refreshCredits(),
+      API.getProviderCredits('provider2', { audit: true }),
+    ]);
+    const totalP1 = Number(resP1?.credits || 0);
+    const totalP2 = Number(
+      typeof resP2?.total === 'number' ? resP2.total
+        : (typeof resP2?.balance === 'number' ? resP2.balance : (typeof resP2?.credits === 'number' ? resP2.credits : 0))
+    );
+    if (status) status.textContent = `P1: ${totalP1.toFixed(2)} cr | P2: $${totalP2.toFixed(2)}`;
     if (typeof showToast === 'function') showToast('Refresh balances xong', 'success');
     await refreshSidebarCredits();
+    await loadDataFromAPI();
+    await loadSettingsKeyHistory(20);
   } catch (err) {
     if (typeof showToast === 'function') showToast(err.message || 'Refresh balances th\u1EA5t b\u1EA1i', 'error');
   }
@@ -1625,6 +2189,7 @@ async function refreshSidebarCredits() {
     let p2 = 0;
     if (typeof p2Res?.credits === 'number') p2 = Number(p2Res.credits);
     else if (typeof p2Res?.balance === 'number') p2 = Number(p2Res.balance);
+    else if (typeof p2Res?.total === 'number') p2 = Number(p2Res.total);
     const p1El = document.getElementById('creditP1');
     const p2El = document.getElementById('creditP2');
     if (p1El) p1El.textContent = `${p1.toLocaleString()} cr`;
