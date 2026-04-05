@@ -45,6 +45,7 @@ import routes.auth_routes as auth_routes_module
 import routes.reports_routes as reports_routes_module
 from routes.notifications_routes import create_notifications_router
 from routes.auth_routes import (
+    build_auth_user_payload,
     create_auth_router,
     get_effective_pending_expiry,
     get_role_permissions,
@@ -94,76 +95,20 @@ def _parse_cors_origins() -> list[str]:
 logger = logging.getLogger(__name__)
 # Source marker: keep main.py touched so uvicorn reloads from the current workspace copy.
 
-_ROLE_ALIASES = {
-    "qc": "qc_manager",
-    "qcmanager": "qc_manager",
-    "quality_control": "qc_manager",
-    "quality_controller": "qc_manager",
-    "administrator": "admin",
-}
-_ROLE_PERMISSIONS = {
-    "staff": {"create_video", "create_image", "view_own_history", "view_library"},
-    "qc_manager": {
-        "create_video",
-        "create_image",
-        "view_own_history",
-        "view_library",
-        "qc_approve",
-        "qc_reject",
-        "view_all_history",
-        "view_dashboard",
-    },
-    "admin": {
-        "create_video",
-        "create_image",
-        "view_own_history",
-        "view_library",
-        "qc_approve",
-        "qc_reject",
-        "view_all_history",
-        "view_dashboard",
-        "manage_users",
-        "manage_keys",
-        "manage_settings",
-        "view_billing",
-    },
-}
-_LOGIN_APPROVAL_BYPASS_PERMS = {
-    "qc_approve",
-    "qc_reject",
-    "manage_users",
-    "manage_keys",
-    "manage_settings",
-    "view_dashboard",
-    "view_all_history",
-}
-
-
 def _normalize_role(role_id: str) -> str:
-    role = str(role_id or "staff").strip().lower().replace("-", "_").replace(" ", "_")
-    return _ROLE_ALIASES.get(role, role or "staff")
+    return normalize_role_id(role_id)
 
 
 def _role_permissions(role_id: str) -> list[str]:
-    return sorted(_ROLE_PERMISSIONS.get(_normalize_role(role_id), set()))
+    return get_role_permissions(role_id)
 
 
 def _user_has_permission_local(user_data: dict | None, permission: str) -> bool:
-    user = dict(user_data or {})
-    perms = user.get("permissions") or _role_permissions(user.get("role"))
-    return permission in set(str(p) for p in perms)
+    return user_has_permission(dict(user_data or {}), permission)
 
 
 def _build_auth_user_payload_local(user_data: dict) -> dict:
-    role = _normalize_role(user_data.get("role"))
-    return {
-        "id": user_data["id"],
-        "username": user_data["username"],
-        "display_name": user_data.get("display_name", user_data["username"]),
-        "role": role,
-        "permissions": _role_permissions(role),
-        "login_2fa_enabled": bool(user_data.get("login_2fa_enabled", 0)),
-    }
+    return build_auth_user_payload(user_data)
 
 # â”€â”€â”€ Model Definitions â”€â”€â”€
 def _get_tier(quality: str = "kling25") -> dict:
@@ -186,6 +131,9 @@ def _find_camera(cam_id: str) -> str:
 
 _JWT_ALGO = "HS256"
 _JWT_TTL_SECONDS = int(os.getenv("JWT_EXPIRE_SECONDS", "28800"))
+_PENDING_QC_REJECT_INPUTS: dict[str, dict] = {}
+_PENDING_REGISTER_REJECT_INPUTS: dict[str, dict] = {}
+_PENDING_PASSWORD_RESET_REJECT_INPUTS: dict[str, dict] = {}
 
 
 def _jwt_decode(token: str) -> Optional[dict]:
@@ -228,16 +176,10 @@ def _get_user(request: Request) -> Optional[dict]:
             conn.close()
             if not row or not row["active"]:
                 return None
-            role = _normalize_role(row.get("role"))
-            return {
-                "user_id": row["id"],
-                "username": row["username"],
-                "display_name": row.get("display_name", row["username"]),
-                "role": role,
-                "permissions": _role_permissions(role),
-                "login_2fa_enabled": bool(row.get("login_2fa_enabled", 0)),
-                "exp": int(claims.get("exp", 0)),
-            }
+            payload = _build_auth_user_payload_local(dict(row))
+            payload["user_id"] = row["id"]
+            payload["exp"] = int(claims.get("exp", 0))
+            return payload
         except Exception:
             return None
     return None
@@ -342,6 +284,7 @@ async def _handle_tg_callback(cb: dict):
     tg_first = from_info.get("first_name", "")
     tg_last = from_info.get("last_name", "")
     tg_username = from_info.get("username", "")
+    tg_from_id = str(from_info.get("id", "") or "")
     approver_name = f"{tg_first} {tg_last}".strip() or tg_username or "Admin"
     log_activity(
         approver_name,
@@ -437,6 +380,237 @@ async def _handle_tg_callback(cb: dict):
             await tg._edit_message_text(chat_id, msg_id,
                 f"Da chan login: <b>{r['username']}</b>\n"
                 f"Nguoi chan: <b>{approver_name}</b>", "HTML")
+    elif data.startswith("register_approve:"):
+        request_id = data.split(":", 1)[1]
+        conn = db.get_conn()
+        row = conn.execute("SELECT * FROM pending_registrations WHERE id=?", (request_id,)).fetchone()
+        if not row:
+            await tg._answer_callback(cb_id, "Yeu cau tao tai khoan khong ton tai")
+            conn.close(); return
+        r = dict(row)
+        if str(r.get("status") or "").lower() != "pending":
+            await tg._answer_callback(cb_id, f"Yeu cau da xu ly: {r.get('status')}")
+            conn.close(); return
+        exists = conn.execute(
+            "SELECT 1 FROM users WHERE LOWER(TRIM(username))=LOWER(TRIM(?)) LIMIT 1",
+            (r.get("username"),),
+        ).fetchone()
+        if exists:
+            conn.execute(
+                "UPDATE pending_registrations SET status='rejected', reviewer=?, reject_reason=?, reviewed_at=? WHERE id=?",
+                (approver_name, "Username da ton tai", time.time(), request_id),
+            )
+            conn.commit()
+            conn.close()
+            await tg._answer_callback(cb_id, "Username da ton tai")
+            if chat_id and msg_id:
+                await tg._edit_message_text(
+                    chat_id,
+                    msg_id,
+                    f"Tu choi tao tai khoan: <b>{r.get('username') or '-'}</b>\nLy do: Username da ton tai\nNguoi xu ly: <b>{approver_name}</b>",
+                    "HTML",
+                )
+            return
+        user_id = str(uuid.uuid4())
+        conn.execute(
+            """
+            INSERT INTO users (id, username, password_hash, display_name, role, employee_code, login_2fa_enabled, active, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                user_id,
+                str(r.get("username") or "").strip(),
+                str(r.get("password_hash") or "").strip(),
+                str(r.get("display_name") or r.get("username") or "").strip(),
+                str(r.get("role") or "staff").strip(),
+                str(r.get("employee_code") or "").strip(),
+                0,
+                1,
+                time.time(),
+            ),
+        )
+        conn.execute(
+            "UPDATE pending_registrations SET status='approved', password_hash='', reviewer=?, reviewed_at=? WHERE id=?",
+            (approver_name, time.time(), request_id),
+        )
+        conn.commit()
+        conn.close()
+        db.add_notification(
+            user_id,
+            "account_approved",
+            "Tai khoan da duoc phe duyet",
+            f"{approver_name} da phe duyet tai khoan cua ban",
+        )
+        log_activity(
+            approver_name,
+            "Register Approve",
+            f"{r.get('username')} | role={r.get('role')} | employee_code={r.get('employee_code') or '-'} | request_id={request_id}",
+            0,
+            "auth_register",
+        )
+        await tg._answer_callback(cb_id, f"Da duyet tai khoan {r.get('username')}")
+        if chat_id and msg_id:
+            await tg._edit_message_text(
+                chat_id,
+                msg_id,
+                f"Da duyet tao tai khoan: <b>{r.get('username') or '-'}</b>\nVai tro: <b>{r.get('role') or 'staff'}</b>\nNguoi duyet: <b>{approver_name}</b>",
+                "HTML",
+            )
+    elif data.startswith("register_reject:"):
+        request_id = data.split(":", 1)[1]
+        conn = db.get_conn()
+        row = conn.execute("SELECT * FROM pending_registrations WHERE id=?", (request_id,)).fetchone()
+        if not row:
+            await tg._answer_callback(cb_id, "Yeu cau tao tai khoan khong ton tai")
+            conn.close(); return
+        r = dict(row)
+        if str(r.get("status") or "").lower() != "pending":
+            await tg._answer_callback(cb_id, f"Yeu cau da xu ly: {r.get('status')}")
+            conn.close(); return
+        conn.close()
+        if tg_from_id:
+            _PENDING_REGISTER_REJECT_INPUTS[tg_from_id] = {
+                "request_id": request_id,
+                "approver_name": approver_name,
+                "chat_id": str(chat_id or ""),
+                "message_id": str(msg_id or ""),
+                "username": str(r.get("username") or ""),
+                "display_name": str(r.get("display_name") or r.get("username") or ""),
+                "role": str(r.get("role") or "staff"),
+                "created_at": time.time(),
+            }
+        await tg._answer_callback(cb_id, f"Nhap ly do tu choi tai khoan {r.get('username')}")
+        if chat_id and msg_id:
+            await tg._edit_message_text(
+                chat_id,
+                msg_id,
+                f"<b>[TAO TAI KHOAN CHO LY DO TU CHOI]</b>\nTai khoan: <b>{r.get('username') or '-'}</b>\nVai tro: <b>{r.get('role') or 'staff'}</b>\nGui them 1 tin nhan de nhap ly do tu choi.",
+                "HTML",
+            )
+    elif data.startswith("pwreset_approve:"):
+        request_id = data.split(":", 1)[1]
+        conn = db.get_conn()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_password_resets (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                username TEXT NOT NULL,
+                display_name TEXT DEFAULT '',
+                employee_code TEXT DEFAULT '',
+                password_hash TEXT NOT NULL,
+                ip TEXT DEFAULT '',
+                device TEXT DEFAULT '',
+                status TEXT DEFAULT 'pending',
+                reviewer TEXT DEFAULT '',
+                reject_reason TEXT DEFAULT '',
+                created_at REAL DEFAULT 0,
+                expires_at REAL DEFAULT 0,
+                reviewed_at REAL DEFAULT 0
+            )
+            """
+        )
+        pwreset_columns = {str(r[1]).lower() for r in conn.execute("PRAGMA table_info(pending_password_resets)").fetchall()}
+        if "expires_at" not in pwreset_columns:
+            conn.execute("ALTER TABLE pending_password_resets ADD COLUMN expires_at REAL DEFAULT 0")
+        row = conn.execute("SELECT * FROM pending_password_resets WHERE id=?", (request_id,)).fetchone()
+        if not row:
+            await tg._answer_callback(cb_id, "Yeu cau reset khong ton tai")
+            conn.close(); return
+        r = dict(row)
+        if str(r.get("status") or "").lower() != "pending":
+            await tg._answer_callback(cb_id, f"Yeu cau da xu ly: {r.get('status')}")
+            conn.close(); return
+        created_at = float(r.get("created_at") or time.time())
+        expires_at = float(r.get("expires_at") or (created_at + 300))
+        if expires_at <= created_at or (expires_at - created_at) > 86400:
+            expires_at = created_at + 300
+        if time.time() > expires_at:
+            conn.execute("UPDATE pending_password_resets SET status='expired', password_hash='', reviewed_at=? WHERE id=?", (time.time(), request_id))
+            conn.commit()
+            conn.close()
+            await tg._answer_callback(cb_id, "Yeu cau reset da het han")
+            if chat_id and msg_id:
+                await tg._edit_message_text(
+                    chat_id,
+                    msg_id,
+                    f"Yeu cau reset mat khau da het han: <b>{r.get('username') or '-'}</b>\nMa nhan vien: <b>{r.get('employee_code') or '-'}</b>",
+                    "HTML",
+                )
+            return
+        conn.execute("UPDATE users SET password_hash=? WHERE id=?", (str(r.get("password_hash") or "").strip(), str(r.get("user_id") or "").strip()))
+        conn.execute("UPDATE pending_password_resets SET status='approved', password_hash='', reviewer=?, reviewed_at=? WHERE id=?", (approver_name, time.time(), request_id))
+        conn.commit()
+        conn.close()
+        db.add_notification(
+            str(r.get("user_id") or "").strip(),
+            "password_reset_approved",
+            "Reset mat khau da duoc duyet",
+            f"{approver_name} da duyet yeu cau reset mat khau cua ban",
+            {"request_id": request_id},
+        )
+        log_activity(
+            approver_name,
+            "Password Reset Approve",
+            f"{r.get('username')} | request_id={request_id}",
+            0,
+            "auth_recover",
+        )
+        await tg._answer_callback(cb_id, f"Da duyet reset mat khau {r.get('username')}")
+        if chat_id and msg_id:
+            await tg._edit_message_text(
+                chat_id,
+                msg_id,
+                f"Da duyet reset mat khau: <b>{r.get('username') or '-'}</b>\nMa nhan vien: <b>{r.get('employee_code') or '-'}</b>\nNguoi duyet: <b>{approver_name}</b>",
+                "HTML",
+            )
+    elif data.startswith("pwreset_reject:"):
+        request_id = data.split(":", 1)[1]
+        conn = db.get_conn()
+        row = conn.execute("SELECT * FROM pending_password_resets WHERE id=?", (request_id,)).fetchone()
+        if not row:
+            await tg._answer_callback(cb_id, "Yeu cau reset khong ton tai")
+            conn.close(); return
+        r = dict(row)
+        if str(r.get("status") or "").lower() != "pending":
+            await tg._answer_callback(cb_id, f"Yeu cau da xu ly: {r.get('status')}")
+            conn.close(); return
+        created_at = float(r.get("created_at") or time.time())
+        expires_at = float(r.get("expires_at") or (created_at + 300))
+        if expires_at <= created_at or (expires_at - created_at) > 86400:
+            expires_at = created_at + 300
+        if time.time() > expires_at:
+            conn.execute("UPDATE pending_password_resets SET status='expired', password_hash='', reviewed_at=? WHERE id=?", (time.time(), request_id))
+            conn.commit()
+            conn.close()
+            await tg._answer_callback(cb_id, "Yeu cau reset da het han")
+            if chat_id and msg_id:
+                await tg._edit_message_text(
+                    chat_id,
+                    msg_id,
+                    f"Yeu cau reset mat khau da het han: <b>{r.get('username') or '-'}</b>\nMa nhan vien: <b>{r.get('employee_code') or '-'}</b>",
+                    "HTML",
+                )
+            return
+        conn.close()
+        if tg_from_id:
+            _PENDING_PASSWORD_RESET_REJECT_INPUTS[tg_from_id] = {
+                "request_id": request_id,
+                "approver_name": approver_name,
+                "chat_id": str(chat_id or ""),
+                "message_id": str(msg_id or ""),
+                "username": str(r.get("username") or ""),
+                "employee_code": str(r.get("employee_code") or ""),
+                "created_at": time.time(),
+            }
+        await tg._answer_callback(cb_id, f"Nhap ly do tu choi reset mat khau {r.get('username')}")
+        if chat_id and msg_id:
+            await tg._edit_message_text(
+                chat_id,
+                msg_id,
+                f"<b>[RESET MAT KHAU CHO LY DO TU CHOI]</b>\nTai khoan: <b>{r.get('username') or '-'}</b>\nMa nhan vien: <b>{r.get('employee_code') or '-'}</b>\nGui them 1 tin nhan de nhap ly do tu choi.",
+                "HTML",
+            )
     elif data.startswith("qc_approve:"):
         qc_id = data.split(":", 1)[1]
         conn = db.get_conn()
@@ -494,46 +668,27 @@ async def _handle_tg_callback(cb: dict):
         if str(q.get("status") or "").lower() != "pending":
             await tg._answer_callback(cb_id, f"QC da xu ly: {q.get('status')}")
             conn.close(); return
-        reject_reason = "Reject via Telegram"
-        conn.execute(
-            "UPDATE qc_queue SET status='rejected', reviewer=?, reject_reason=?, reviewed_at=? WHERE id=?",
-            (approver_name, reject_reason, time.time(), qc_id),
-        )
-        conn.commit()
         conn.close()
-        conn2 = db.get_conn()
-        user_row = conn2.execute("SELECT id FROM users WHERE username=?", (q.get("user_name"),)).fetchone()
-        conn2.close()
-        if user_row:
-            db.add_notification(
-                user_row["id"],
-                "qc_rejected",
-                "Video bi tu choi",
-                f"Video {q.get('task_id')} bi reject boi {approver_name} (Telegram)",
-                {"qc_id": qc_id, "task_id": q.get("task_id"), "reason": reject_reason},
-            )
-        log_activity(
-            approver_name,
-            "QC Reject",
-            f"qc_id={qc_id} | task_id={q.get('task_id')} | via=telegram_callback | reason={reject_reason}",
-            0,
-            "qc_reject",
-        )
-        await tg._answer_callback(cb_id, f"Da reject QC {qc_id}")
+        if tg_from_id:
+            _PENDING_QC_REJECT_INPUTS[tg_from_id] = {
+                "qc_id": qc_id,
+                "approver_name": approver_name,
+                "chat_id": str(chat_id or ""),
+                "message_id": str(msg_id or ""),
+                "task_id": str(q.get("task_id") or ""),
+                "user_name": str(q.get("user_name") or ""),
+                "user_display": str(q.get("user_display") or q.get("user_name") or ""),
+                "created_at": time.time(),
+            }
+        await tg._answer_callback(cb_id, f"Nhap ly do reject cho QC {qc_id}")
         asyncio.ensure_future(
-            tg.send_qc_result(
-                q.get("task_id") or "",
-                q.get("user_display") or q.get("user_name") or "",
-                False,
-                approver_name,
-                reject_reason,
-            )
+            tg.reply_to_message(str(chat_id or ""), f"QC {qc_id}: hay gui 1 tin nhan tiep theo chua ly do reject.")
         )
         if chat_id and msg_id:
             await tg._edit_message_text(
                 chat_id,
                 msg_id,
-                f"<b>[QC BI TU CHOI]</b>\nTask ID: <code>{q.get('task_id') or '-'}</code>\nQC ID: <code>{qc_id}</code>\nReviewer: <b>{approver_name}</b>",
+                f"<b>[QC CHO LY DO TU CHOI]</b>\nTask ID: <code>{q.get('task_id') or '-'}</code>\nQC ID: <code>{qc_id}</code>\nReviewer: <b>{approver_name}</b>\nGui them 1 tin nhan de nhap ly do reject.",
                 "HTML",
             )
     else:
@@ -746,11 +901,203 @@ async def _daily_report_scheduler():
 
 
 async def _handle_tg_command(msg: dict, command: str):
-    """Handle Telegram bot commands /baocao_ngay, /baocao_tuan, /baocao_thang."""
+    """Handle Telegram commands and pending text workflows."""
     chat_id = str(msg.get("chat", {}).get("id", ""))
     if not chat_id:
         return
-    cmd = command.split("@")[0].lower()  # strip @botname suffix
+    from_info = msg.get("from", {}) or {}
+    tg_from_id = str(from_info.get("id", "") or "")
+    text = str(command or "").strip()
+    if tg_from_id:
+        pending_reject = _PENDING_QC_REJECT_INPUTS.get(tg_from_id)
+        if pending_reject and text and not text.startswith("/"):
+            reject_reason = text[:500].strip()
+            if not reject_reason:
+                await tg.reply_to_message(chat_id, "Ly do reject khong duoc de trong.")
+                return
+            qc_id = str(pending_reject.get("qc_id") or "")
+            approver_name = str(pending_reject.get("approver_name") or from_info.get("username") or "Admin")
+            conn = db.get_conn()
+            row = conn.execute("SELECT * FROM qc_queue WHERE id=?", (qc_id,)).fetchone()
+            if not row:
+                conn.close()
+                _PENDING_QC_REJECT_INPUTS.pop(tg_from_id, None)
+                await tg.reply_to_message(chat_id, f"QC {qc_id} khong ton tai.")
+                return
+            q = dict(row)
+            if str(q.get("status") or "").lower() != "pending":
+                conn.close()
+                _PENDING_QC_REJECT_INPUTS.pop(tg_from_id, None)
+                await tg.reply_to_message(chat_id, f"QC {qc_id} da xu ly: {q.get('status')}")
+                return
+            conn.execute(
+                "UPDATE qc_queue SET status='rejected', reviewer=?, reject_reason=?, reviewed_at=? WHERE id=?",
+                (approver_name, reject_reason, time.time(), qc_id),
+            )
+            conn.commit()
+            conn.close()
+            conn2 = db.get_conn()
+            user_row = conn2.execute("SELECT id FROM users WHERE username=?", (q.get("user_name"),)).fetchone()
+            conn2.close()
+            if user_row:
+                db.add_notification(
+                    user_row["id"],
+                    "qc_rejected",
+                    "Video bi tu choi",
+                    f"Video {q.get('task_id')} bi reject boi {approver_name} (Telegram): {reject_reason}",
+                    {"qc_id": qc_id, "task_id": q.get("task_id"), "reason": reject_reason},
+                )
+            log_activity(
+                approver_name,
+                "QC Reject",
+                f"qc_id={qc_id} | task_id={q.get('task_id')} | via=telegram_message | reason={reject_reason}",
+                0,
+                "qc_reject",
+            )
+            asyncio.ensure_future(
+                tg.send_qc_result(
+                    q.get("task_id") or "",
+                    q.get("user_display") or q.get("user_name") or "",
+                    False,
+                    approver_name,
+                    reject_reason,
+                )
+            )
+            await tg.reply_to_message(chat_id, f"Da reject QC {qc_id} voi ly do: {reject_reason}")
+            original_chat_id = str(pending_reject.get("chat_id") or "")
+            original_message_id = pending_reject.get("message_id")
+            if original_chat_id and original_message_id:
+                try:
+                    await tg._edit_message_text(
+                        int(original_chat_id),
+                        int(original_message_id),
+                        f"<b>[QC BI TU CHOI]</b>\nTask ID: <code>{q.get('task_id') or '-'}</code>\nQC ID: <code>{qc_id}</code>\nReviewer: <b>{approver_name}</b>\nLy do: {reject_reason}",
+                        "HTML",
+                    )
+                except Exception:
+                    pass
+            _PENDING_QC_REJECT_INPUTS.pop(tg_from_id, None)
+            return
+        pending_register_reject = _PENDING_REGISTER_REJECT_INPUTS.get(tg_from_id)
+        if pending_register_reject and text and not text.startswith("/"):
+            reject_reason = text[:500].strip()
+            if not reject_reason:
+                await tg.reply_to_message(chat_id, "Ly do tu choi tai khoan khong duoc de trong.")
+                return
+            request_id = str(pending_register_reject.get("request_id") or "")
+            approver_name = str(pending_register_reject.get("approver_name") or from_info.get("username") or "Admin")
+            conn = db.get_conn()
+            row = conn.execute("SELECT * FROM pending_registrations WHERE id=?", (request_id,)).fetchone()
+            if not row:
+                conn.close()
+                _PENDING_REGISTER_REJECT_INPUTS.pop(tg_from_id, None)
+                await tg.reply_to_message(chat_id, f"Yeu cau {request_id} khong ton tai.")
+                return
+            r = dict(row)
+            if str(r.get("status") or "").lower() != "pending":
+                conn.close()
+                _PENDING_REGISTER_REJECT_INPUTS.pop(tg_from_id, None)
+                await tg.reply_to_message(chat_id, f"Yeu cau {request_id} da xu ly: {r.get('status')}")
+                return
+            conn.execute(
+                "UPDATE pending_registrations SET status='rejected', reviewer=?, reject_reason=?, reviewed_at=? WHERE id=?",
+                (approver_name, reject_reason, time.time(), request_id),
+            )
+            conn.commit()
+            conn.close()
+            log_activity(
+                approver_name,
+                "Register Reject",
+                f"{r.get('username')} | role={r.get('role')} | request_id={request_id} | reason={reject_reason}",
+                0,
+                "auth_register",
+            )
+            await tg.reply_to_message(chat_id, f"Da tu choi tai khoan {r.get('username')} voi ly do: {reject_reason}")
+            original_chat_id = str(pending_register_reject.get("chat_id") or "")
+            original_message_id = pending_register_reject.get("message_id")
+            if original_chat_id and original_message_id:
+                try:
+                    await tg._edit_message_text(
+                        int(original_chat_id),
+                        int(original_message_id),
+                        f"<b>[TAO TAI KHOAN BI TU CHOI]</b>\nTai khoan: <b>{r.get('username') or '-'}</b>\nVai tro: <b>{r.get('role') or 'staff'}</b>\nNguoi xu ly: <b>{approver_name}</b>\nLy do: {reject_reason}",
+                        "HTML",
+                    )
+                except Exception:
+                    pass
+            _PENDING_REGISTER_REJECT_INPUTS.pop(tg_from_id, None)
+            return
+        pending_pwreset_reject = _PENDING_PASSWORD_RESET_REJECT_INPUTS.get(tg_from_id)
+        if pending_pwreset_reject and text and not text.startswith("/"):
+            reject_reason = text[:500].strip()
+            if not reject_reason:
+                await tg.reply_to_message(chat_id, "Ly do tu choi reset mat khau khong duoc de trong.")
+                return
+            request_id = str(pending_pwreset_reject.get("request_id") or "")
+            approver_name = str(pending_pwreset_reject.get("approver_name") or from_info.get("username") or "Admin")
+            conn = db.get_conn()
+            row = conn.execute("SELECT * FROM pending_password_resets WHERE id=?", (request_id,)).fetchone()
+            if not row:
+                conn.close()
+                _PENDING_PASSWORD_RESET_REJECT_INPUTS.pop(tg_from_id, None)
+                await tg.reply_to_message(chat_id, f"Yeu cau {request_id} khong ton tai.")
+                return
+            r = dict(row)
+            if str(r.get("status") or "").lower() != "pending":
+                conn.close()
+                _PENDING_PASSWORD_RESET_REJECT_INPUTS.pop(tg_from_id, None)
+                await tg.reply_to_message(chat_id, f"Yeu cau {request_id} da xu ly: {r.get('status')}")
+                return
+            created_at = float(r.get("created_at") or time.time())
+            expires_at = float(r.get("expires_at") or (created_at + 300))
+            if expires_at <= created_at or (expires_at - created_at) > 86400:
+                expires_at = created_at + 300
+            if time.time() > expires_at:
+                conn.execute("UPDATE pending_password_resets SET status='expired', password_hash='', reviewed_at=? WHERE id=?", (time.time(), request_id))
+                conn.commit()
+                conn.close()
+                _PENDING_PASSWORD_RESET_REJECT_INPUTS.pop(tg_from_id, None)
+                await tg.reply_to_message(chat_id, f"Yeu cau {request_id} da het han.")
+                return
+            conn.execute(
+                "UPDATE pending_password_resets SET status='rejected', password_hash='', reviewer=?, reject_reason=?, reviewed_at=? WHERE id=?",
+                (approver_name, reject_reason, time.time(), request_id),
+            )
+            conn.commit()
+            conn.close()
+            db.add_notification(
+                str(r.get("user_id") or "").strip(),
+                "password_reset_rejected",
+                "Reset mat khau bi tu choi",
+                f"{approver_name} da tu choi yeu cau reset mat khau cua ban. Ly do: {reject_reason}",
+                {"request_id": request_id, "reason": reject_reason},
+            )
+            log_activity(
+                approver_name,
+                "Password Reset Reject",
+                f"{r.get('username')} | request_id={request_id} | reason={reject_reason}",
+                0,
+                "auth_recover",
+            )
+            await tg.reply_to_message(chat_id, f"Da tu choi reset mat khau {r.get('username')} voi ly do: {reject_reason}")
+            original_chat_id = str(pending_pwreset_reject.get("chat_id") or "")
+            original_message_id = pending_pwreset_reject.get("message_id")
+            if original_chat_id and original_message_id:
+                try:
+                    await tg._edit_message_text(
+                        int(original_chat_id),
+                        int(original_message_id),
+                        f"<b>[RESET MAT KHAU BI TU CHOI]</b>\nTai khoan: <b>{r.get('username') or '-'}</b>\nMa nhan vien: <b>{r.get('employee_code') or '-'}</b>\nNguoi xu ly: <b>{approver_name}</b>\nLy do: {reject_reason}",
+                        "HTML",
+                    )
+                except Exception:
+                    pass
+            _PENDING_PASSWORD_RESET_REJECT_INPUTS.pop(tg_from_id, None)
+            return
+
+    cmd = text.split("@")[0].lower()  # strip @botname suffix
+    if not cmd.startswith("/"):
+        return
     if cmd == "/baocao_ngay":
         await tg.reply_to_message(chat_id, "Dang tong hop bao cao ngay...")
         await _build_and_send_report("day")

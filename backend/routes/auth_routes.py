@@ -1,6 +1,7 @@
 """Authentication and login-approval routes."""
 import json
 import os
+import re
 import time
 import uuid
 
@@ -149,6 +150,14 @@ def _cleanup_pending_login_rows(conn, now_ts: float | None = None):
     )
 
 
+def _cleanup_pending_registration_rows(conn, now_ts: float | None = None):
+    now = float(now_ts or time.time())
+    conn.execute(
+        "DELETE FROM pending_registrations WHERE status IN ('approved','rejected','replaced') AND COALESCE(reviewed_at, created_at, 0) < ?",
+        (now - 7 * 24 * 3600,),
+    )
+
+
 def role_bypasses_login_approval(role_id: str) -> bool:
     role = normalize_role_id(role_id)
     if role in ("admin", "qc_manager"):
@@ -161,6 +170,12 @@ def get_role_permissions(role_id: str) -> list[str]:
     role = normalize_role_id(role_id)
     perms = sorted(_load_role_permission_map().get(role, set()))
     return perms
+
+
+def get_allowed_role_ids() -> list[str]:
+    mapping = _load_role_permission_map()
+    keys = sorted(mapping.keys())
+    return keys or ["staff", "qc_manager", "admin"]
 
 
 def user_has_permission(user_or_role, permission: str) -> bool:
@@ -182,6 +197,7 @@ def build_auth_user_payload(user_row) -> dict:
         "username": user["username"],
         "display_name": user.get("display_name", user["username"]),
         "role": role,
+        "employee_code": user.get("employee_code", ""),
         "permissions": get_role_permissions(role),
         "login_2fa_enabled": bool(user.get("login_2fa_enabled", 0)),
     }
@@ -233,12 +249,64 @@ class RegisterReq(BaseModel):
     password: str
     display_name: str = ""
     role: str = "staff"
+    employee_code: str = ""
+
+
+class RecoverByEmployeeCodeReq(BaseModel):
+    username: str
+    employee_code: str
+    password: str
+
+
+def _ensure_pending_password_resets_table(conn):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_password_resets (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            username TEXT NOT NULL,
+            display_name TEXT DEFAULT '',
+            employee_code TEXT DEFAULT '',
+            password_hash TEXT NOT NULL,
+            ip TEXT DEFAULT '',
+            device TEXT DEFAULT '',
+            status TEXT DEFAULT 'pending',
+            reviewer TEXT DEFAULT '',
+            reject_reason TEXT DEFAULT '',
+            created_at REAL DEFAULT 0,
+            expires_at REAL DEFAULT 0,
+            reviewed_at REAL DEFAULT 0
+        )
+        """
+    )
+    columns = {str(r[1]).lower() for r in conn.execute("PRAGMA table_info(pending_password_resets)").fetchall()}
+    if "expires_at" not in columns:
+        conn.execute("ALTER TABLE pending_password_resets ADD COLUMN expires_at REAL DEFAULT 0")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_password_resets_username ON pending_password_resets(username)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_password_resets_employee_code ON pending_password_resets(employee_code)")
+
+
+def _cleanup_pending_password_reset_rows(conn, now_ts: float | None = None):
+    now = float(now_ts or time.time())
+    _ensure_pending_password_resets_table(conn)
+    conn.execute(
+        "UPDATE pending_password_resets SET status='expired', password_hash='', reviewed_at=? WHERE status='pending' AND COALESCE(expires_at, 0) > 0 AND COALESCE(expires_at, 0) <= ?",
+        (now, now),
+    )
+    conn.execute(
+        "UPDATE pending_password_resets SET password_hash='' WHERE status IN ('approved','rejected','expired','replaced') AND COALESCE(password_hash,'') <> ''",
+    )
+    conn.execute(
+        "DELETE FROM pending_password_resets WHERE status IN ('approved','rejected','expired','replaced') AND COALESCE(reviewed_at, created_at, 0) < ?",
+        (now - 7 * 24 * 3600,),
+    )
 
 
 class UpdateUserReq(BaseModel):
     display_name: str = ""
     role: str = "staff"
     password: str = ""
+    employee_code: str = ""
     login_2fa_enabled: bool = False
     active: bool = True
 
@@ -249,6 +317,28 @@ def normalize_username(value: str) -> str:
 
 def normalize_display_name(value: str, fallback: str) -> str:
     return str(value or "").strip() or str(fallback or "").strip()
+
+
+def normalize_employee_code(value: str) -> str:
+    return str(value or "").strip().upper()
+
+
+def validate_employee_code_for_role(employee_code: str, role_id: str) -> str:
+    role = normalize_role_id(role_id)
+    code = normalize_employee_code(employee_code)
+    requires_code = role in {"staff", "qc_manager"}
+    if requires_code and not code:
+        raise HTTPException(400, "Ma nhan vien la bat buoc cho staff va qc_manager")
+    if code and not re.fullmatch(r"F\d{3,}", code):
+        raise HTTPException(400, "Ma nhan vien phai co dang Fxxx, vi du F0202")
+    return code
+
+
+def validate_optional_employee_code(employee_code: str) -> str:
+    code = normalize_employee_code(employee_code)
+    if code and not re.fullmatch(r"F\d{3,}", code):
+        raise HTTPException(400, "Ma nhan vien phai co dang Fxxx, vi du F0202")
+    return code
 
 
 def create_auth_router(require_user, require_admin, make_token, db, tg, asyncio_mod):
@@ -437,6 +527,7 @@ def create_auth_router(require_user, require_admin, make_token, db, tg, asyncio_
         if not username or not str(req.password or ""):
             raise HTTPException(400, "Username va password la bat buoc")
         role_id = normalize_role_id(req.role)
+        employee_code = validate_optional_employee_code(req.employee_code)
         conn = db.get_conn()
         exists = conn.execute(
             "SELECT 1 FROM users WHERE LOWER(TRIM(username))=LOWER(TRIM(?)) LIMIT 1",
@@ -445,25 +536,321 @@ def create_auth_router(require_user, require_admin, make_token, db, tg, asyncio_
         if exists:
             conn.close()
             raise HTTPException(400, "Username da ton tai")
+        if employee_code:
+            code_exists = conn.execute(
+                "SELECT 1 FROM users WHERE UPPER(TRIM(COALESCE(employee_code,'')))=UPPER(TRIM(?)) LIMIT 1",
+                (employee_code,),
+            ).fetchone()
+            if code_exists:
+                conn.close()
+                raise HTTPException(400, "Ma nhan vien da ton tai")
         pw_hash = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
         user_id = str(uuid.uuid4())
         conn.execute(
             """
-            INSERT INTO users (id, username, password_hash, display_name, role, login_2fa_enabled, active, created_at)
-            VALUES (?,?,?,?,?,?,?,?)
+            INSERT INTO users (id, username, password_hash, display_name, role, employee_code, login_2fa_enabled, active, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?)
             """,
-            (user_id, username, pw_hash, normalize_display_name(req.display_name, username), role_id, 0, 1, time.time()),
+            (user_id, username, pw_hash, normalize_display_name(req.display_name, username), role_id, employee_code, 0, 1, time.time()),
         )
         conn.commit()
         conn.close()
         log_activity(
             user["display_name"],
             "User Create",
-            f"{username} | role={role_id}",
+            f"{username} | role={role_id} | employee_code={employee_code or '-'}",
             0,
             "auth_users",
         )
         return {"ok": True, "user_id": user_id}
+
+    @router.post("/api/auth/register-request")
+    async def auth_register_request(req: RegisterReq, request: Request):
+        username = normalize_username(req.username)
+        if not username or not str(req.password or ""):
+            raise HTTPException(400, "Username va password la bat buoc")
+        role_id = normalize_role_id(req.role)
+        employee_code = validate_employee_code_for_role(req.employee_code, role_id)
+        allowed_roles = set(get_allowed_role_ids())
+        if role_id not in allowed_roles:
+            raise HTTPException(400, "Vai tro khong hop le")
+
+        client_ip = request.client.host if request.client else "unknown"
+        device = request.headers.get("X-Device-Name", "") or request.headers.get("User-Agent", "unknown")[:100]
+        conn = db.get_conn()
+        _cleanup_pending_registration_rows(conn, time.time())
+        exists = conn.execute(
+            "SELECT 1 FROM users WHERE LOWER(TRIM(username))=LOWER(TRIM(?)) LIMIT 1",
+            (username,),
+        ).fetchone()
+        if exists:
+            conn.close()
+            raise HTTPException(400, "Username da ton tai")
+
+        latest_request = conn.execute(
+            """
+            SELECT id, status, reject_reason, reviewer, reviewed_at, created_at
+            FROM pending_registrations
+            WHERE LOWER(TRIM(username))=LOWER(TRIM(?))
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (username,),
+        ).fetchone()
+        if latest_request and str(latest_request["status"] or "").lower() == "pending":
+            conn.close()
+            raise HTTPException(409, "Username dang cho admin phe duyet. Yeu cau dang ky van con o trang thai cho duyet.")
+        if latest_request and str(latest_request["status"] or "").lower() == "rejected":
+            reason = str(latest_request["reject_reason"] or "").strip()
+            reviewer = str(latest_request["reviewer"] or "").strip()
+            reviewed_at = latest_request["reviewed_at"]
+            detail = "Yeu cau dang ky truoc da bi tu choi."
+            if reason:
+                detail += f" Ly do: {reason}"
+            if reviewer:
+                detail += f" Reviewer: {reviewer}"
+            if reviewed_at:
+                detail += f" ReviewedAt: {reviewed_at}"
+            conn.close()
+            raise HTTPException(409, detail)
+        if employee_code:
+            existing_code = conn.execute(
+                "SELECT 1 FROM users WHERE UPPER(TRIM(COALESCE(employee_code,'')))=UPPER(TRIM(?)) LIMIT 1",
+                (employee_code,),
+            ).fetchone()
+            if existing_code:
+                conn.close()
+                raise HTTPException(409, "Ma nhan vien da ton tai")
+            pending_code = conn.execute(
+                """
+                SELECT id, status
+                FROM pending_registrations
+                WHERE UPPER(TRIM(COALESCE(employee_code,'')))=UPPER(TRIM(?))
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (employee_code,),
+            ).fetchone()
+            if pending_code and str(pending_code["status"] or "").lower() == "pending":
+                conn.close()
+                raise HTTPException(409, "Ma nhan vien dang cho admin phe duyet")
+
+        conn.execute(
+            "UPDATE pending_registrations SET status='replaced' WHERE LOWER(TRIM(username))=LOWER(TRIM(?)) AND status='pending'",
+            (username,),
+        )
+        req_id = str(uuid.uuid4())[:8]
+        pw_hash = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
+        display_name = normalize_display_name(req.display_name, username)
+        conn.execute(
+            """
+            INSERT INTO pending_registrations
+            (id, username, password_hash, display_name, role, employee_code, ip, device, status, reviewer, reject_reason, created_at, reviewed_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (req_id, username, pw_hash, display_name, role_id, employee_code, client_ip, device, "pending", "", "", time.time(), 0),
+        )
+        conn.commit()
+        conn.close()
+
+        asyncio_mod.ensure_future(
+            tg.send_registration_pending(
+                username,
+                display_name,
+                role_id,
+                employee_code,
+                device,
+                client_ip,
+                req_id,
+            )
+        )
+        log_activity(
+            display_name,
+            "Register Pending",
+            f"{username} | role={role_id} | employee_code={employee_code or '-'} | request_id={req_id} | ip={client_ip}",
+            0,
+            "auth_register",
+        )
+        return {"status": "pending", "request_id": req_id, "message": "Cho admin phe duyet tai khoan"}
+
+    @router.get("/api/auth/register-request/{request_id}")
+    async def auth_register_request_status(request_id: str):
+        req_id = str(request_id or "").strip()
+        if not req_id:
+            raise HTTPException(400, "Thieu request_id")
+        conn = db.get_conn()
+        _cleanup_pending_registration_rows(conn, time.time())
+        row = conn.execute(
+            """
+            SELECT id, username, display_name, role, employee_code, status, reviewer, reject_reason, created_at, reviewed_at
+            FROM pending_registrations
+            WHERE id=?
+            LIMIT 1
+            """,
+            (req_id,),
+        ).fetchone()
+        conn.close()
+        if not row:
+            raise HTTPException(404, "Khong tim thay yeu cau dang ky")
+        status = str(row["status"] or "pending").strip().lower() or "pending"
+        return {
+            "request_id": str(row["id"] or ""),
+            "username": str(row["username"] or ""),
+            "display_name": str(row["display_name"] or ""),
+            "role": str(row["role"] or "staff"),
+            "employee_code": str(row["employee_code"] or ""),
+            "status": status,
+            "reviewer": str(row["reviewer"] or ""),
+            "reject_reason": str(row["reject_reason"] or ""),
+            "created_at": row["created_at"] or 0,
+            "reviewed_at": row["reviewed_at"] or 0,
+        }
+
+    @router.post("/api/auth/recover-by-employee-code")
+    async def auth_recover_by_employee_code(req: RecoverByEmployeeCodeReq, request: Request):
+        username = normalize_username(req.username)
+        employee_code = normalize_employee_code(req.employee_code)
+        if not username:
+            raise HTTPException(400, "Username la bat buoc")
+        if not employee_code:
+            raise HTTPException(400, "Ma nhan vien la bat buoc")
+        if not re.fullmatch(r"F\d{3,}", employee_code):
+            raise HTTPException(400, "Ma nhan vien phai co dang Fxxx, vi du F0202")
+        password = str(req.password or "")
+        if not password.strip():
+            raise HTTPException(400, "Mat khau moi la bat buoc")
+        if len(password) < 8:
+            raise HTTPException(400, "Mat khau moi phai tu 8 ky tu")
+        conn = db.get_conn()
+        _ensure_pending_password_resets_table(conn)
+        _cleanup_pending_password_reset_rows(conn, time.time())
+        row = conn.execute(
+            """
+            SELECT id, username, display_name, role, employee_code, password_hash
+            FROM users
+            WHERE LOWER(TRIM(COALESCE(username,'')))=LOWER(TRIM(?))
+              AND UPPER(TRIM(COALESCE(employee_code,'')))=UPPER(TRIM(?)) AND active=1
+                AND LOWER(TRIM(COALESCE(role,''))) IN ('staff','qc_manager')
+            LIMIT 1
+            """,
+            (username, employee_code),
+        ).fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(404, "Khong tim thay tai khoan phu hop voi username va ma nhan vien nay")
+        current_hash = str(row["password_hash"] or "").strip()
+        if current_hash:
+            try:
+                if bcrypt.checkpw(password.encode(), current_hash.encode()):
+                    conn.close()
+                    raise HTTPException(400, "Mat khau moi phai khac mat khau hien tai")
+            except ValueError:
+                pass
+        request_id = str(uuid.uuid4())[:12]
+        created_at = time.time()
+        expires_at = created_at + 300
+        password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+        client_ip = request.client.host if request.client else ""
+        device = request.headers.get("X-Device-Name", "") or request.headers.get("User-Agent", "")[:160]
+        conn.execute(
+            "UPDATE pending_password_resets SET status='replaced', reviewed_at=? WHERE LOWER(TRIM(COALESCE(username,'')))=LOWER(TRIM(?)) AND status='pending'",
+            (created_at, username),
+        )
+        conn.execute(
+            """
+            INSERT INTO pending_password_resets
+            (id, user_id, username, display_name, employee_code, password_hash, ip, device, status, reviewer, reject_reason, created_at, expires_at, reviewed_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                request_id,
+                str(row["id"] or "").strip(),
+                str(row["username"] or "").strip(),
+                str(row["display_name"] or row["username"] or "").strip(),
+                employee_code,
+                password_hash,
+                client_ip,
+                device,
+                "pending",
+                "",
+                "",
+                created_at,
+                expires_at,
+                0,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        asyncio_mod.ensure_future(
+            tg.send_password_reset_pending(
+                str(row["username"] or "").strip(),
+                str(row["display_name"] or row["username"] or "").strip(),
+                employee_code,
+                device,
+                client_ip,
+                request_id,
+            )
+        )
+        log_activity(
+            str(row["display_name"] or row["username"] or "").strip(),
+            "Password Reset Request",
+            f"{row['username']} | employee_code={employee_code} | request_id={request_id}",
+            0,
+            "auth_recover",
+        )
+        return {
+            "ok": True,
+            "request_id": request_id,
+            "status": "pending",
+            "username": str(row["username"] or "").strip(),
+            "display_name": str(row["display_name"] or row["username"] or "").strip(),
+            "employee_code": employee_code,
+            "expires_at": expires_at,
+            "seconds_left": max(0, int(expires_at - time.time())),
+            "message": "Yeu cau reset da duoc gui cho admin phe duyet",
+        }
+
+    @router.get("/api/auth/password-reset-request/{request_id}")
+    async def auth_password_reset_request_status(request_id: str):
+        req_id = str(request_id or "").strip()
+        if not req_id:
+            raise HTTPException(400, "Thieu request_id")
+        conn = db.get_conn()
+        _ensure_pending_password_resets_table(conn)
+        _cleanup_pending_password_reset_rows(conn, time.time())
+        row = conn.execute(
+            """
+            SELECT id, username, display_name, employee_code, status, reviewer, reject_reason, created_at, expires_at, reviewed_at
+            FROM pending_password_resets
+            WHERE id=?
+            LIMIT 1
+            """,
+            (req_id,),
+        ).fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(404, "Khong tim thay yeu cau reset")
+        payload = with_pending_timing(dict(row))
+        status = str(payload.get("status") or "pending").strip().lower() or "pending"
+        if status == "pending" and payload["seconds_left"] <= 0:
+            conn.execute("UPDATE pending_password_resets SET status='expired', password_hash='', reviewed_at=? WHERE id=?", (time.time(), req_id))
+            conn.commit()
+            payload["status"] = "expired"
+            payload["seconds_left"] = 0
+        conn.close()
+        return {
+            "request_id": str(payload["id"] or ""),
+            "username": str(payload["username"] or ""),
+            "display_name": str(payload["display_name"] or ""),
+            "employee_code": str(payload["employee_code"] or ""),
+            "status": str(payload["status"] or "pending").strip().lower() or "pending",
+            "reviewer": str(payload["reviewer"] or ""),
+            "reject_reason": str(payload["reject_reason"] or ""),
+            "created_at": payload["created_at"] or 0,
+            "expires_at": payload["expires_at"] or 0,
+            "seconds_left": max(0, int(payload.get("seconds_left") or 0)),
+            "reviewed_at": payload["reviewed_at"] or 0,
+        }
 
     @router.post("/api/auth/repair-users")
     async def auth_repair_users(request: Request):
@@ -567,7 +954,7 @@ def create_auth_router(require_user, require_admin, make_token, db, tg, asyncio_
         role_id = normalize_role_id(req.role)
         conn = db.get_conn()
         row = conn.execute(
-            "SELECT id, username, display_name, role, login_2fa_enabled, active FROM users WHERE id=?",
+            "SELECT id, username, display_name, role, employee_code, login_2fa_enabled, active FROM users WHERE id=?",
             (user_id,),
         ).fetchone()
         if not row:
@@ -577,17 +964,27 @@ def create_auth_router(require_user, require_admin, make_token, db, tg, asyncio_
         password_hash = None
         if str(req.password or "").strip():
             password_hash = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
+        employee_code = validate_optional_employee_code(req.employee_code)
+        if employee_code:
+            code_exists = conn.execute(
+                "SELECT 1 FROM users WHERE UPPER(TRIM(COALESCE(employee_code,'')))=UPPER(TRIM(?)) AND id<>? LIMIT 1",
+                (employee_code, user_id),
+            ).fetchone()
+            if code_exists:
+                conn.close()
+                raise HTTPException(400, "Ma nhan vien da ton tai")
 
         if password_hash:
             conn.execute(
                 """
                 UPDATE users
-                SET display_name=?, role=?, login_2fa_enabled=?, active=?, password_hash=?
+                SET display_name=?, role=?, employee_code=?, login_2fa_enabled=?, active=?, password_hash=?
                 WHERE id=?
                 """,
                 (
                     req.display_name or row["display_name"] or row["username"],
                     role_id,
+                    employee_code,
                     1 if req.login_2fa_enabled else 0,
                     1 if req.active else 0,
                     password_hash,
@@ -598,12 +995,13 @@ def create_auth_router(require_user, require_admin, make_token, db, tg, asyncio_
             conn.execute(
                 """
                 UPDATE users
-                SET display_name=?, role=?, login_2fa_enabled=?, active=?
+                SET display_name=?, role=?, employee_code=?, login_2fa_enabled=?, active=?
                 WHERE id=?
                 """,
                 (
                     req.display_name or row["display_name"] or row["username"],
                     role_id,
+                    employee_code,
                     1 if req.login_2fa_enabled else 0,
                     1 if req.active else 0,
                     user_id,
@@ -611,13 +1009,14 @@ def create_auth_router(require_user, require_admin, make_token, db, tg, asyncio_
             )
         conn.commit()
         updated = conn.execute(
-            "SELECT id, username, display_name, role, login_2fa_enabled, active, created_at FROM users WHERE id=?",
+            "SELECT id, username, display_name, role, employee_code, login_2fa_enabled, active, created_at FROM users WHERE id=?",
             (user_id,),
         ).fetchone()
         conn.close()
         changed_parts = [
             f"display_name={req.display_name or row['display_name'] or row['username']}",
             f"role={role_id}",
+            f"employee_code={employee_code or '-'}",
             f"active={1 if req.active else 0}",
             f"login_2fa_enabled={1 if req.login_2fa_enabled else 0}",
         ]

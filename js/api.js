@@ -61,31 +61,53 @@ const API = {
     opts.headers = headers;
     const res = await fetch(url, opts);
     if (res.status === 401) {
-      this.clearToken();
+      if (typeof resetClientAuthState === 'function') resetClientAuthState();
+      else this.clearToken();
       if (typeof showLoginScreen === 'function') showLoginScreen();
       throw new Error('Unauthorized');
     }
     return res;
   },
 
+  async parseResponse(res) {
+    let payload = null;
+    const contentType = String(res.headers.get('content-type') || '').toLowerCase();
+    try {
+      payload = contentType.includes('application/json') ? await res.json() : await res.text();
+    } catch (_) {
+      payload = null;
+    }
+    if (!res.ok) {
+      const message =
+        (payload && typeof payload === 'object' && (payload.detail || payload.message || payload.error)) ||
+        (typeof payload === 'string' && payload) ||
+        `HTTP ${res.status}`;
+      const err = new Error(String(message || `HTTP ${res.status}`));
+      err.status = res.status;
+      err.payload = payload;
+      throw err;
+    }
+    return payload;
+  },
+
   async get(path) {
     const res = await this.fetch(path);
-    return res.json();
+    return this.parseResponse(res);
   },
 
   async post(path, body) {
     const res = await this.fetch(path, { method: 'POST', body });
-    return res.json();
+    return this.parseResponse(res);
   },
 
   async put(path, body) {
     const res = await this.fetch(path, { method: 'PUT', body });
-    return res.json();
+    return this.parseResponse(res);
   },
 
   async del(path) {
     const res = await this.fetch(path, { method: 'DELETE' });
-    return res.json();
+    return this.parseResponse(res);
   },
 
   // ========== AUTH ==========
@@ -94,7 +116,7 @@ const API = {
       method: 'POST',
       body: { username, password },
     });
-    return res.json();
+    return this.parseResponse(res);
   },
 
   async getMe() {
@@ -111,6 +133,22 @@ const API = {
 
   async registerUser(data) {
     return this.post('/api/auth/register', data);
+  },
+
+  async requestRegistration(data) {
+    return this.post('/api/auth/register-request', data);
+  },
+
+  async getRegistrationRequestStatus(requestId) {
+    return this.get('/api/auth/register-request/' + encodeURIComponent(String(requestId || '').trim()));
+  },
+
+  async recoverByEmployeeCode(data) {
+    return this.post('/api/auth/recover-by-employee-code', data);
+  },
+
+  async getPasswordResetRequestStatus(requestId) {
+    return this.get('/api/auth/password-reset-request/' + encodeURIComponent(String(requestId || '').trim()));
   },
 
   async repairUsers() {
@@ -144,7 +182,7 @@ const API = {
       method: 'POST',
       body: formData, // FormData — no JSON stringify
     });
-    return res.json();
+    return this.parseResponse(res);
   },
 
   // Create single video task
@@ -159,7 +197,7 @@ const API = {
 
   // Create batch of video tasks
   async batchVideo(tasks) {
-    return this.post('/api/video/batch', { tasks });
+    return this.post('/api/video/batch', { items: tasks });
   },
 
   // Poll batch status
@@ -207,6 +245,14 @@ const API = {
     return this.get('/api/qc/queue');
   },
 
+  async claimQC(id) {
+    return this.post('/api/qc/claim/' + id, {});
+  },
+
+  async releaseQC(id) {
+    return this.post('/api/qc/release/' + id, {});
+  },
+
   async approveQC(id, note) {
     return this.post('/api/qc/approve/' + id, { note: note || '' });
   },
@@ -232,6 +278,14 @@ const API = {
     return this.get('/api/credits/keys');
   },
 
+  async addCreditKey(key) {
+    return this.post('/api/credits/keys/add', { key });
+  },
+
+  async setActiveCreditKey(index) {
+    return this.post('/api/credits/keys/set-active', { index });
+  },
+
   async replaceCreditKeys(keys, activeIndex = 0) {
     return this.post('/api/credits/keys/replace', { keys, active_index: activeIndex });
   },
@@ -245,8 +299,8 @@ const API = {
     return this.get('/api/providers');
   },
 
-  async getProviderCredits(providerId) {
-    return this.get('/api/providers/' + providerId + '/credits');
+  async getProviderCredits(providerId, { audit = false } = {}) {
+    return this.get('/api/providers/' + providerId + '/credits' + (audit ? '?audit=1' : ''));
   },
 
   async getKeyStatus() {
@@ -257,8 +311,24 @@ const API = {
     return this.get('/api/providers/provider2/keys');
   },
 
+  async getProviderKeyHistory(limit = 20) {
+    return this.get('/api/providers/key-history?limit=' + encodeURIComponent(limit));
+  },
+
   async setProvider2Key(key) {
     return this.post('/api/providers/provider2/keys/set', { key });
+  },
+
+  async replaceProvider2Keys(keys, activeIndex = 0) {
+    return this.post('/api/providers/provider2/keys/replace', { keys, active_index: activeIndex });
+  },
+
+  async addProvider2Key(key) {
+    return this.post('/api/providers/provider2/keys/add', { key });
+  },
+
+  async setProvider2ActiveKey(index) {
+    return this.post('/api/providers/provider2/keys/set-active', { index });
   },
 
   async getProviderSettings() {
@@ -326,7 +396,7 @@ const API = {
       method: 'POST',
       body: formData, // FormData with image file
     });
-    return res.json();
+    return this.parseResponse(res);
   },
 
   async chatAgent(messages, model = 'gemini-2.5-flash') {
@@ -338,7 +408,7 @@ const API = {
         stream: false,
       },
     });
-    return res.json();
+    return this.parseResponse(res);
   },
 
   // Get available chat models
@@ -366,7 +436,7 @@ const API = {
     const res = await this.fetch('/api/chat/history?session_key=' + encodeURIComponent(sessionKey), {
       method: 'DELETE',
     });
-    return res.json();
+    return this.parseResponse(res);
   },
 
   // ========== REPORTS ==========
@@ -388,6 +458,14 @@ const API = {
     return this.get('/api/library');
   },
 
+  async cleanupLibraryNoResult(userName = '', confirm = true) {
+    const params = new URLSearchParams();
+    if (userName) params.set('user_name', userName);
+    if (confirm) params.set('confirm', 'true');
+    const query = params.toString() ? ('?' + params.toString()) : '';
+    return this.post('/api/library/cleanup-no-result' + query, {});
+  },
+
   // ========== INPUT ASSETS ==========
   async getInputAssets({ userName = '', sessionId = '', codeTag = '', limit = 300 } = {}) {
     const params = new URLSearchParams();
@@ -404,7 +482,7 @@ const API = {
       method: 'POST',
       body: formData,
     });
-    return res.json();
+    return this.parseResponse(res);
   },
 
   async patchInputAsset(assetId, data) {
@@ -412,14 +490,14 @@ const API = {
       method: 'PATCH',
       body: data || {},
     });
-    return res.json();
+    return this.parseResponse(res);
   },
 
   async deleteInputAsset(assetId) {
     const res = await this.fetch('/api/input-assets/' + encodeURIComponent(assetId), {
       method: 'DELETE',
     });
-    return res.json();
+    return this.parseResponse(res);
   },
 
   async recoverStuckMedia() {
@@ -461,6 +539,10 @@ const API = {
   // ========== NOTIFICATIONS ==========
   async getNotifications() {
     return this.get('/api/notifications');
+  },
+
+  async getNotificationUnreadCount() {
+    return this.get('/api/notifications/unread-count');
   },
 
   async markNotifRead(id) {
