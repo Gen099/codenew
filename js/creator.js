@@ -19,6 +19,12 @@ let selectedImageIds = [];
 let bulkSelectMode = false;
 let creatorPresenceTimer = 0;
 let creatorAssetsLoaded = false;
+let recalcAllCostsTimer = 0;
+let creatorDraftSaveTimer = 0;
+let creatorRealtimePollTimer = 0;
+let creatorUploadProgressVisible = false;
+let creatorLastQCSyncAt = 0;
+let creatorLastLibraryRenderSignature = '';
 
 // ---- DATA ALIASES (point to unified AppData) ----
 const DEMO_IMAGES = AppData.images;
@@ -26,12 +32,351 @@ const DEMO_LIBRARY = AppData.library;
 const PRESETS = AppData.presets;
 const CAMERA_MOVES = AppData.cameraMoves;
 const MODELS = [AppData.model];
+const VIDEO_EFFECT_GROUPS = [
+  { id: 'none', label: '-- None --' },
+  { id: 'add_interior', label: 'Th\u00eam n\u1ed9i th\u1ea5t' },
+  { id: 'four_seasons', label: '4 M\u00f9a' },
+  { id: 'day_to_night', label: 'Ng\u00e0y sang \u0111\u00eam' },
+  { id: 'noel_decor', label: 'Trang tr\u00ed Noel' },
+  { id: 'add_person', label: 'Th\u00eam ng\u01b0\u1eddi' },
+  { id: 'explosion', label: 'V\u1ee5 n\u1ed5' },
+  { id: 'fire_effect', label: 'Hi\u1ec7u \u1ee9ng l\u1eeda' },
+  { id: 'partial_build', label: 'X\u00e2y d\u1ef1ng t\u1eebng ph\u1ea7n' },
+  { id: 'custom', label: 'T\u00f9y ch\u1ecdn kh\u00e1c' },
+];
+
+function getEffectGroupLabel(effectGroup) {
+  const key = String(effectGroup || '').trim().toLowerCase() || 'none';
+  const found = VIDEO_EFFECT_GROUPS.find((row) => String(row.id || '').trim().toLowerCase() === key);
+  return found ? found.label : '-- None --';
+}
+
+function getTaskEffectDisplay(task) {
+  const key = String(task?.effectGroup || '').trim().toLowerCase() || 'none';
+  if (key === 'none') return '-- None --';
+  if (key === 'custom') {
+    const customText = String(task?.effectGroupCustom || '').trim();
+    if (customText) return customText;
+  }
+  return getEffectGroupLabel(key);
+}
+
+function getComboEffectSummary(combo) {
+  const tasks = Array.isArray(combo?.tasks) ? combo.tasks : [];
+  const map = new Map();
+  tasks.forEach((task) => {
+    const key = getTaskEffectDisplay(task);
+    map.set(key, Number(map.get(key) || 0) + 1);
+  });
+  if (map.size === 0) return '';
+  let bestKey = '';
+  let bestCount = -1;
+  for (const [key, count] of map.entries()) {
+    if (count > bestCount) {
+      bestKey = key;
+      bestCount = count;
+    }
+  }
+  return bestKey || '';
+}
 
 function getCreatorSessionId() {
   const activeShiftId = String(AppData?.activeShift?.id || '').trim();
   if (activeShiftId) return activeShiftId;
   const scopedUser = (typeof getScopeUsername === 'function') ? String(getScopeUsername() || '').trim() : '';
   return scopedUser || String(AppData?.currentUser?.username || '').trim() || 'default';
+}
+
+function getCreatorDraftStorageKey() {
+  const scopedUser = (typeof getScopeUsername === 'function')
+    ? String(getScopeUsername() || '').trim().toLowerCase()
+    : String(AppData?.currentUser?.username || '').trim().toLowerCase();
+  return `creatorDraft:${scopedUser || 'default'}`;
+}
+
+function serializeCreatorDraftTask(task) {
+  const nextTask = task && typeof task === 'object' ? { ...task } : createDefaultTask();
+  delete nextTask.__inflight;
+  if (!Array.isArray(nextTask.runHistory)) nextTask.runHistory = [];
+  return nextTask;
+}
+
+function saveCreatorDraftState() {
+  try {
+    const payload = {
+      activeComboIdx: Number(activeComboIdx || 0),
+      comboCounter: Number(comboCounter || 0),
+      libraryOpen: !!libraryOpen,
+      taskCombos: Array.isArray(taskCombos)
+        ? taskCombos.map((combo, idx) => ({
+            id: combo?.id || idx + 1,
+            name: String(combo?.name || `CODE-${String(idx + 1).padStart(2, '0')}`),
+            qcMode: String(combo?.qcMode || 'individual'),
+            tasks: Array.isArray(combo?.tasks) ? combo.tasks.map(serializeCreatorDraftTask) : [],
+          }))
+        : [],
+    };
+    localStorage.setItem(getCreatorDraftStorageKey(), JSON.stringify(payload));
+  } catch (_) {}
+}
+
+function scheduleSaveCreatorDraftState(delay = 120) {
+  try {
+    clearTimeout(creatorDraftSaveTimer);
+    creatorDraftSaveTimer = setTimeout(() => {
+      saveCreatorDraftState();
+    }, Math.max(0, Number(delay || 0)));
+  } catch (_) {}
+}
+
+function setCreatorUploadProgress(message) {
+  const text = String(message || '').trim();
+  const existing = document.getElementById('creatorUploadProgress');
+  if (!text) {
+    creatorUploadProgressVisible = false;
+    if (existing) existing.remove();
+    return;
+  }
+  creatorUploadProgressVisible = true;
+  if (existing) {
+    existing.textContent = text;
+    return;
+  }
+  const host = document.getElementById('creatorContent') || document.body;
+  if (!host) return;
+  const el = document.createElement('div');
+  el.id = 'creatorUploadProgress';
+  el.className = 'cr-upload-progress';
+  el.textContent = text;
+  host.appendChild(el);
+}
+
+function clearCreatorDraftState() {
+  try {
+    localStorage.removeItem(getCreatorDraftStorageKey());
+  } catch (_) {}
+}
+
+function ensureCreatorRealtimePolling() {
+  try {
+    if (creatorRealtimePollTimer) return;
+    creatorRealtimePollTimer = setInterval(() => {
+      try {
+        autoPollRunningTasks();
+        autoSyncQCStatuses();
+      } catch (_) {}
+    }, 2500);
+  } catch (_) {}
+}
+
+function autoPollRunningTasks() {
+  if (!Array.isArray(taskCombos) || taskCombos.length === 0) return;
+  taskCombos.forEach((combo) => {
+    const tasks = Array.isArray(combo?.tasks) ? combo.tasks : [];
+    tasks.forEach((task) => {
+      if (!task) return;
+      if (String(task.status || '').toLowerCase() !== 'running') return;
+      if (!String(task.taskId || '').trim()) return;
+      if (task.__polling) return;
+      pollTaskStatusByRef(task, combo, { silent: true });
+    });
+  });
+}
+
+function _applyTaskLifecycleState(task, nextState, extra = {}) {
+  if (!task || typeof task !== 'object') return;
+  const state = String(nextState || '').trim().toLowerCase();
+  if (!state) return;
+  const failMsg = Object.prototype.hasOwnProperty.call(extra, 'failMsg')
+    ? _normalizeTaskFailureMessage(extra.failMsg || '')
+    : String(task.failMsg || '').trim();
+  const progressValue = Object.prototype.hasOwnProperty.call(extra, 'progress')
+    ? Number(extra.progress || 0)
+    : Number(task.progress || 0);
+
+  if (state === 'submitting') {
+    task.status = 'running';
+    task.progress = 0;
+    task.failMsg = '';
+    task.__inflight = true;
+    return;
+  }
+  if (state === 'running') {
+    task.status = 'running';
+    task.progress = Math.max(0, Math.min(99, Number.isFinite(progressValue) ? progressValue : 0));
+    task.failMsg = '';
+    return;
+  }
+  if (state === 'fail') {
+    task.status = 'fail';
+    task.progress = 0;
+    task.failMsg = failMsg || 'Task thất bại';
+    task.__inflight = false;
+    task.__polling = false;
+    if (!String(task.runFinishedAt || '').trim()) task.runFinishedAt = new Date().toISOString();
+    return;
+  }
+  if (state === 'done') {
+    task.status = 'done';
+    task.progress = 100;
+    task.failMsg = '';
+    task.__inflight = false;
+    task.__polling = false;
+    if (!String(task.runFinishedAt || '').trim()) task.runFinishedAt = new Date().toISOString();
+    return;
+  }
+  if (state === 'pending_qc' || state === 'approved' || state === 'rejected') {
+    task.qcStatus = state;
+    task.status = 'done';
+    task.progress = 100;
+    if (state === 'rejected' && failMsg) task.failMsg = failMsg;
+    else if (state !== 'rejected') task.failMsg = '';
+    task.__inflight = false;
+    task.__polling = false;
+    if (!String(task.runFinishedAt || '').trim()) task.runFinishedAt = new Date().toISOString();
+  }
+}
+
+function applyTaskQCMeta(task, libItem, qcRow) {
+  if (!task) return;
+  const row = (qcRow && typeof qcRow === 'object' ? qcRow : (libItem && typeof libItem === 'object' ? libItem : {}));
+  const statusRaw = String(row.status || '').trim().toLowerCase();
+  const note = String(row.reject_reason || row.qcNote || row.qc_note || row.note || task.qcNote || '').trim();
+  let nextQcStatus = String(task.qcStatus || '').trim().toLowerCase();
+  if (statusRaw === 'pending') nextQcStatus = 'pending_qc';
+  else if (statusRaw === 'pending_qc' || statusRaw === 'approved' || statusRaw === 'rejected') nextQcStatus = statusRaw;
+  if (nextQcStatus) {
+    task.qcStatus = nextQcStatus;
+    _applyTaskLifecycleState(task, nextQcStatus, { failMsg: note, progress: 100 });
+  }
+  task.qcNote = note;
+  task.qcReviewer = String(row.reviewer || row.qcReviewer || row.qc_reviewer || task.qcReviewer || '').trim();
+  task.qcReviewedAt = row.reviewed_at || row.qcReviewedAt || row.qc_reviewed_at || task.qcReviewedAt || '';
+  if (libItem) {
+    if (task.qcStatus) {
+      libItem.qcStatus = task.qcStatus;
+      if (task.qcStatus === 'pending_qc' || task.qcStatus === 'approved' || task.qcStatus === 'rejected') {
+        libItem.status = task.qcStatus;
+      }
+    }
+    libItem.qcNote = task.qcNote || '';
+    libItem.qcReviewer = task.qcReviewer || '';
+    libItem.qcReviewedAt = task.qcReviewedAt || '';
+  }
+}
+
+async function syncTaskQCStatusByRef(task, comboRef = null, options = {}) {
+  const silent = !!options?.silent;
+  const combo = comboRef || _findTaskOwnerCombo(task) || taskCombos[activeComboIdx];
+  if (!task || !combo) return;
+  const taskId = String(task.taskId || '').trim();
+  if (!taskId) return;
+  if (task.__qcPolling) return;
+  const beforeSignature = _getTaskRuntimeSignature(task);
+  task.__qcPolling = true;
+  try {
+    if (!API || typeof API.getQCStatus !== 'function') return;
+    const libItem = AppData.library.find((i) => i.id === task.id || i.taskId === taskId) || null;
+    const row = await API.getQCStatus(taskId);
+    const rowStatus = String(row && row.status ? row.status : '').trim().toLowerCase();
+    if (row && rowStatus && rowStatus !== 'none') {
+      applyTaskQCMeta(task, libItem, row);
+      return;
+    }
+    const libQcStatus = String(libItem?.qcStatus || '').trim().toLowerCase();
+    if (libItem && libQcStatus && libQcStatus !== 'none') {
+      applyTaskQCMeta(task, libItem, null);
+    }
+  } catch (err) {
+    if (!silent) showToast(`Lấy trạng thái QC thất bại: ${err && err.message ? err.message : 'Lỗi không xác định'}`, 'error');
+  } finally {
+    task.__qcPolling = false;
+  }
+  const afterSignature = _getTaskRuntimeSignature(task);
+  if (afterSignature !== beforeSignature) {
+    _rerenderTaskByRef(task, combo);
+    renderLibraryIfChanged();
+    scheduleSaveCreatorDraftState(0);
+  }
+}
+
+function autoSyncQCStatuses() {
+  const now = Date.now();
+  if (now - creatorLastQCSyncAt < 4000) return;
+  creatorLastQCSyncAt = now;
+  taskCombos.forEach((combo) => {
+    const tasks = Array.isArray(combo?.tasks) ? combo.tasks : [];
+    tasks.forEach((task) => {
+      if (!task) return;
+      if (!String(task.taskId || '').trim()) return;
+      syncTaskQCStatusByRef(task, combo, { silent: true }).catch(() => {});
+    });
+  });
+}
+
+function _getTaskRuntimeSignature(task) {
+  if (!task || typeof task !== 'object') return '';
+  return JSON.stringify({
+    status: String(task.status || '').trim(),
+    progress: Math.round(Number(task.progress || 0) || 0),
+    taskId: String(task.taskId || '').trim(),
+    resultUrl: String(task.resultUrl || '').trim(),
+    failMsg: String(task.failMsg || '').trim(),
+    qcStatus: String(task.qcStatus || '').trim(),
+    qcNote: String(task.qcNote || '').trim(),
+    qcReviewer: String(task.qcReviewer || '').trim(),
+    qcReviewedAt: String(task.qcReviewedAt || '').trim(),
+    inflight: !!task.__inflight,
+    polling: !!task.__polling,
+    runHistoryCount: Array.isArray(task.runHistory) ? task.runHistory.length : 0,
+  });
+}
+
+function _getLibraryRenderSignature() {
+  const rows = Array.isArray(DEMO_LIBRARY) ? DEMO_LIBRARY : [];
+  return JSON.stringify(rows.map((item) => ({
+    id: String(item?.id || '').trim(),
+    taskId: String(item?.taskId || '').trim(),
+    status: String(item?.status || '').trim(),
+    qcStatus: String(item?.qcStatus || '').trim(),
+    qcNote: String(item?.qcNote || '').trim(),
+    qcReviewer: String(item?.qcReviewer || '').trim(),
+    qcReviewedAt: String(item?.qcReviewedAt || '').trim(),
+    pct: Math.round(Number(item?.pct || 0) || 0),
+    resultUrl: String(item?.resultUrl || '').trim(),
+    credits: Number(item?.credits || 0) || 0,
+  })));
+}
+
+function renderLibraryIfChanged(force = false) {
+  const nextSignature = _getLibraryRenderSignature();
+  if (!force && nextSignature === creatorLastLibraryRenderSignature) return false;
+  creatorLastLibraryRenderSignature = nextSignature;
+  renderLibrary();
+  return true;
+}
+
+function loadCreatorDraftState() {
+  try {
+    const raw = localStorage.getItem(getCreatorDraftStorageKey());
+    if (!raw) return false;
+    const parsed = JSON.parse(raw);
+    const combos = Array.isArray(parsed?.taskCombos) ? parsed.taskCombos : [];
+    if (!combos.length) return false;
+    taskCombos = combos.map((combo, idx) => ({
+      id: combo?.id || idx + 1,
+      name: String(combo?.name || `CODE-${String(idx + 1).padStart(2, '0')}`),
+      qcMode: String(combo?.qcMode || 'individual'),
+      tasks: Array.isArray(combo?.tasks) ? combo.tasks.map((task) => serializeCreatorDraftTask(task)) : [],
+    }));
+    comboCounter = Math.max(Number(parsed?.comboCounter || taskCombos.length), taskCombos.length);
+    activeComboIdx = Math.max(0, Math.min(Number(parsed?.activeComboIdx || 0), taskCombos.length - 1));
+    libraryOpen = true;
+    normalizeTaskCombos();
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 function mapInputAssetToCreatorImage(row) {
@@ -191,6 +536,523 @@ function getTaskCostLabel(task) {
   return unit === 'usd' ? `$${cost.toFixed(2)}` : `${cost.toLocaleString()} cr`;
 }
 
+function _buildHistoryCodeName(item, idx = 1) {
+  const rawCode = String(item?.codeTag || item?.product_code || '').trim();
+  if (rawCode) return rawCode;
+  const rawTaskId = String(item?.taskId || item?.id || '').trim();
+  if (rawTaskId) return `CODE-${rawTaskId.slice(0, 8).toUpperCase()}`;
+  return `CODE-HISTORY-${String(idx).padStart(2, '0')}`;
+}
+
+function _mapLibraryStatusToTaskStatus(item) {
+  const qcStatus = String(item?.qcStatus || '').toLowerCase();
+  const status = String(item?.status || '').toLowerCase();
+  if (status === 'done' || status === 'approved' || status === 'rejected' || qcStatus === 'approved' || qcStatus === 'rejected') return 'done';
+  if (status === 'processing' || status === 'pending' || qcStatus === 'pending') return 'running';
+  if (status === 'pending_qc' || qcStatus === 'pending_qc') return 'done';
+  if (status === 'fail' || status === 'failed') return 'fail';
+  return 'idle';
+}
+
+function _isTaskActuallyRunning(task) {
+  if (!task || String(task.status || '').toLowerCase() !== 'running') return false;
+  const qcStatus = String(task.qcStatus || '').toLowerCase();
+  if (qcStatus === 'pending_qc' || qcStatus === 'approved' || qcStatus === 'rejected') return false;
+  const progress = Number(task.progress || 0);
+  if (Number.isFinite(progress) && progress >= 100) return false;
+  const taskId = String(task.taskId || '').trim();
+  if (!taskId) return true;
+  const rows = Array.isArray(AppData?.library) ? AppData.library : [];
+  const lib = rows.find((item) => String(item?.taskId || item?.id || '').trim() === taskId);
+  if (!lib) return false;
+  const libStatus = String(lib.status || '').toLowerCase();
+  const libQc = String(lib.qcStatus || '').toLowerCase();
+  if (libStatus === 'processing' || libStatus === 'pending' || libStatus === 'running' || libStatus === 'queued') return true;
+  if (libStatus === 'done' || libStatus === 'approved' || libStatus === 'rejected' || libStatus === 'pending_qc' || libStatus === 'success' || libStatus === 'fail' || libStatus === 'failed') return false;
+  if (libQc === 'pending_qc' || libQc === 'approved' || libQc === 'rejected') return false;
+  return false;
+}
+
+function _hasTaskExecution(task) {
+  if (!task || typeof task !== 'object') return false;
+  if (String(task.taskId || '').trim()) return true;
+  if (String(task.resultUrl || '').trim()) return true;
+  if (String(task.failMsg || '').trim()) return true;
+  if (String(task.status || '').trim().toLowerCase() === 'done') return true;
+  if (String(task.status || '').trim().toLowerCase() === 'fail') return true;
+  if (Number(task.progress || 0) > 0) return true;
+  return false;
+}
+
+function _isCreditExhaustedMessage(message) {
+  const text = String(message || '').trim().toLowerCase();
+  if (!text) return false;
+  return [
+    'insufficient',
+    'exhaust',
+    'out of credit',
+    'out of credits',
+    'no credit',
+    'no credits',
+    'not enough credit',
+    'not enough balance',
+    'credit exhausted',
+    'balance',
+    'quota',
+    'recharge',
+    'hết tiền',
+    'het tien',
+    'không đủ',
+    'khong du',
+    'số dư',
+    'so du',
+  ].some((token) => text.includes(token));
+}
+
+function _normalizeTaskFailureMessage(message) {
+  const raw = String(message || '').trim();
+  if (!raw) return 'Gửi task thất bại';
+  if (_isCreditExhaustedMessage(raw)) return 'Hết tiền';
+  return raw;
+}
+
+function _canStartTaskNow(task) {
+  if (!task || task.__inflight) return false;
+  return !_isTaskActuallyRunning(task);
+}
+
+function _taskHasRunHistory(task) {
+  return !!(_hasTaskExecution(task) || (Array.isArray(task?.runHistory) && task.runHistory.length > 0));
+}
+
+function _buildTaskRunSnapshot(task) {
+  if (!_hasTaskExecution(task)) return null;
+  return {
+    taskId: String(task.taskId || '').trim(),
+    status: String(task.status || '').trim().toLowerCase() || 'idle',
+    progress: Math.max(0, Math.min(100, Number(task.progress || 0) || 0)),
+    resultUrl: String(task.resultUrl || '').trim(),
+    failMsg: String(task.failMsg || '').trim(),
+    qcStatus: String(task.qcStatus || '').trim(),
+    qcNote: String(task.qcNote || '').trim(),
+    qcReviewer: String(task.qcReviewer || '').trim(),
+    prompt: String(task.prompt || '').trim(),
+    provider: String(task.provider || '').trim(),
+    modelId: String(task.modelId || '').trim(),
+    duration: String(task.duration || '').trim(),
+    ratio: String(task.ratio || '').trim(),
+    cameraMove: String(task.cameraMove || '').trim(),
+    credits: Number(task.credits || 0) || 0,
+    runStartedAt: String(task.runStartedAt || '').trim(),
+    runFinishedAt: String(task.runFinishedAt || '').trim(),
+    archivedAt: new Date().toISOString(),
+  };
+}
+
+function _archiveCurrentTaskRun(task) {
+  if (!task || typeof task !== 'object') return;
+  const snapshot = _buildTaskRunSnapshot(task);
+  if (!snapshot) return;
+  if (!Array.isArray(task.runHistory)) task.runHistory = [];
+  const newest = task.runHistory[0];
+  if (newest && newest.taskId && snapshot.taskId && newest.taskId === snapshot.taskId) return;
+  task.runHistory.unshift(snapshot);
+}
+
+function _resetTaskForRerun(task) {
+  if (!task || typeof task !== 'object') return;
+  task.status = 'idle';
+  task.progress = 0;
+  task.taskId = '';
+  task.resultUrl = '';
+  task.failMsg = '';
+  task.qcStatus = null;
+  task.qcNote = '';
+  task.qcReviewer = '';
+  task.qcReviewedAt = '';
+  task.runStartedAt = '';
+  task.runFinishedAt = '';
+}
+
+function _formatTaskRunTime(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return raw;
+  try {
+    return date.toLocaleString('vi-VN');
+  } catch (_) {
+    return raw;
+  }
+}
+
+function _getTaskRunStatusMeta(status, qcStatus, failMsg) {
+  const qc = String(qcStatus || '').trim().toLowerCase();
+  const st = String(status || '').trim().toLowerCase();
+  if (qc === 'approved') return { cls: 'approved', label: 'Đã duyệt' };
+  if (qc === 'rejected') return { cls: 'rejected', label: 'Từ chối' };
+  if (qc === 'pending_qc' || qc === 'pending') return { cls: 'pending', label: 'Chờ QC' };
+  if (st === 'running') return { cls: 'pending', label: 'Đang chạy' };
+  if (st === 'done') return { cls: 'approved', label: 'Hoàn tất' };
+  if (st === 'fail') return { cls: 'rejected', label: failMsg ? 'Thất bại' : 'Lỗi' };
+  return { cls: 'idle', label: 'Chưa chạy' };
+}
+
+function _renderTaskRunHistory(task) {
+  const rows = [];
+  if (_hasTaskExecution(task)) {
+    rows.push({
+      kind: 'current',
+      title: 'Lần hiện tại',
+      ..._buildTaskRunSnapshot(task),
+    });
+  }
+  if (Array.isArray(task?.runHistory)) {
+    task.runHistory.forEach((row, idx) => {
+      rows.push({
+        kind: 'history',
+        title: `Lần trước #${idx + 1}`,
+        ...row,
+      });
+    });
+  }
+  if (!rows.length) {
+    return `
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;min-height:96px">
+        <div style="font-size:9px;font-weight:700;color:var(--muted);margin-bottom:6px"><i class="fa-solid fa-clock-rotate-left" style="color:var(--blue)"></i> LỊCH SỬ CHẠY</div>
+        <div style="font-size:10px;color:var(--muted);line-height:1.5">Chưa có lần chạy nào.</div>
+      </div>
+    `;
+  }
+  const items = rows.map((row, idx) => {
+    const meta = _getTaskRunStatusMeta(row.status, row.qcStatus, row.failMsg);
+    const when = _formatTaskRunTime(row.runFinishedAt || row.runStartedAt || row.archivedAt);
+    const note = String(row.qcNote || row.failMsg || '').trim();
+    return `
+      <div style="${idx > 0 ? 'padding:8px 0 0 0;border-top:1px solid var(--border);margin-top:8px' : 'padding:0'}">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+          <div style="font-size:10px;font-weight:700;color:var(--text)">${row.title}</div>
+          <span class="cr-qc-badge ${meta.cls}">${meta.label}</span>
+        </div>
+        <div style="font-size:10px;color:var(--muted);line-height:1.5;margin-top:4px">
+          ${row.taskId ? `Task ID: ${row.taskId}<br>` : ''}
+          ${when ? `Thời điểm: ${when}<br>` : ''}
+          ${row.progress ? `Tiến độ cuối: ${Math.round(row.progress)}%<br>` : ''}
+          ${note ? `Lý do/Ghi chú: ${note}` : ''}
+        </div>
+      </div>
+    `;
+  }).join('');
+  return `
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;min-height:96px">
+      <div style="font-size:9px;font-weight:700;color:var(--muted);margin-bottom:6px"><i class="fa-solid fa-clock-rotate-left" style="color:var(--blue)"></i> LỊCH SỬ CHẠY</div>
+      <div style="font-size:10px;color:var(--text);line-height:1.5">${items}</div>
+    </div>
+  `;
+}
+
+function _normalizeMatchText(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function _getComboCodeTag(combo) {
+  return String(combo?.codeTag || combo?.name || '').trim();
+}
+
+function _getLibraryRowTimestamp(item) {
+  const raw = item?.createdAt || item?.completedAt || item?.reviewedAt || '';
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
+    return raw > 1e12 ? raw : raw * 1000;
+  }
+  const asText = String(raw || '').trim();
+  if (!asText) return 0;
+  const asNum = Number(asText);
+  if (Number.isFinite(asNum) && asNum > 0) return asNum > 1e12 ? asNum : asNum * 1000;
+  const parsed = Date.parse(asText);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function _buildRunSnapshotFromLibraryItem(item) {
+  if (!item || typeof item !== 'object') return null;
+  const mappedStatus = _mapLibraryStatusToTaskStatus(item);
+  return {
+    taskId: String(item.taskId || item.id || '').trim(),
+    status: mappedStatus,
+    progress: mappedStatus === 'done' ? 100 : Math.max(0, Math.min(100, Number(item.pct || item.progress || 0) || 0)),
+    resultUrl: String(item.resultUrl || '').trim(),
+    failMsg: mappedStatus === 'fail' ? String(item.qcNote || item.failMsg || '').trim() : '',
+    qcStatus: String(item.qcStatus || '').trim(),
+    qcNote: String(item.qcNote || '').trim(),
+    qcReviewer: String(item.qcReviewer || '').trim(),
+    prompt: String(item.prompt || '').trim(),
+    provider: String(item.provider || '').trim(),
+    modelId: String(item.modelId || '').trim(),
+    duration: String(item.duration || '').trim(),
+    ratio: String(item.ratio || '').trim(),
+    cameraMove: String(item.cameraMove || '').trim(),
+    credits: Number(item.credits || 0) || 0,
+    runStartedAt: String(item.createdAt || '').trim(),
+    runFinishedAt: String(item.createdAt || '').trim(),
+    archivedAt: String(item.createdAt || '').trim() || new Date().toISOString(),
+  };
+}
+
+function _dedupeRunSnapshots(rows) {
+  const out = [];
+  const seen = new Set();
+  (Array.isArray(rows) ? rows : []).forEach((row) => {
+    if (!row || typeof row !== 'object') return;
+    const key = String(row.taskId || '').trim() || `${String(row.archivedAt || '').trim()}::${String(row.prompt || '').trim()}`;
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push(row);
+  });
+  return out;
+}
+
+function _isFinalTaskState(status, qcStatus = '') {
+  const st = String(status || '').trim().toLowerCase();
+  const qc = String(qcStatus || '').trim().toLowerCase();
+  if (qc === 'pending_qc' || qc === 'approved' || qc === 'rejected') return true;
+  return st === 'done' || st === 'fail' || st === 'approved' || st === 'rejected' || st === 'pending_qc';
+}
+
+function _isLibraryItemFinalSnapshot(item) {
+  if (!item || typeof item !== 'object') return false;
+  return _isFinalTaskState(String(item.status || '').trim(), String(item.qcStatus || '').trim());
+}
+
+function _mergeTaskRunHistoryFromCandidates(task, candidates, primaryItemId = '') {
+  const primaryId = String(primaryItemId || '').trim();
+  const historicalSnapshots = (Array.isArray(candidates) ? candidates : [])
+    .filter((entry) => String(entry?.itemTaskId || '').trim() !== primaryId)
+    .map((entry) => _buildRunSnapshotFromLibraryItem(entry.item))
+    .filter(Boolean);
+  const existingSnapshots = Array.isArray(task?.runHistory) ? task.runHistory : [];
+  const nextHistory = _dedupeRunSnapshots([...historicalSnapshots, ...existingSnapshots]);
+  const before = JSON.stringify(existingSnapshots);
+  const after = JSON.stringify(nextHistory);
+  task.runHistory = nextHistory;
+  return before !== after;
+}
+
+function _getCandidateLibraryRowsForTask(task, combo) {
+  const rows = Array.isArray(AppData?.library) ? AppData.library : [];
+  const wantedSessionId = _normalizeMatchText(getCreatorSessionId());
+  const wantedCodeTag = _normalizeMatchText(_getComboCodeTag(combo));
+  const wantedTaskId = _normalizeMatchText(task?.taskId);
+  const wantedPrompt = _normalizeMatchText(task?.prompt);
+  const wantedProvider = _normalizeMatchText(task?.provider);
+  const wantedModelId = _normalizeMatchText(task?.modelId);
+  const wantedDuration = _normalizeMatchText(task?.duration);
+  const wantedRatio = _normalizeMatchText(task?.ratio);
+  const wantedCameraMove = _normalizeMatchText(task?.cameraMove);
+  const wantedEffectGroup = _normalizeMatchText(task?.effectGroup);
+  const hasExecution = _hasTaskExecution(task) || (Array.isArray(task?.runHistory) && task.runHistory.length > 0);
+  const requireFinalStateOnly = !wantedTaskId;
+
+  if (!wantedTaskId && !hasExecution) return [];
+
+  return rows
+    .filter((item) => String(item?.type || 'video').toLowerCase() === 'video')
+    .map((item) => {
+      const itemTaskId = _normalizeMatchText(item?.taskId || item?.id);
+      const itemSessionId = _normalizeMatchText(item?.sessionId);
+      const itemCodeTag = _normalizeMatchText(item?.codeTag || item?.product_code);
+      const itemStatus = String(item?.status || '').trim().toLowerCase();
+      const itemQcStatus = String(item?.qcStatus || '').trim().toLowerCase();
+      if (wantedSessionId && itemSessionId && itemSessionId !== wantedSessionId) return null;
+      if (wantedCodeTag && itemCodeTag && itemCodeTag !== wantedCodeTag) return null;
+      if (requireFinalStateOnly) {
+        const isFinal = (
+          itemStatus === 'done' ||
+          itemStatus === 'approved' ||
+          itemStatus === 'rejected' ||
+          itemStatus === 'fail' ||
+          itemStatus === 'failed' ||
+          itemStatus === 'pending_qc' ||
+          itemQcStatus === 'approved' ||
+          itemQcStatus === 'rejected' ||
+          itemQcStatus === 'pending_qc'
+        );
+        if (!isFinal) return null;
+      }
+
+      let score = 0;
+      if (wantedTaskId && itemTaskId && itemTaskId === wantedTaskId) score += 1000;
+      if (wantedPrompt && _normalizeMatchText(item?.prompt) === wantedPrompt) score += 10;
+      if (wantedProvider && _normalizeMatchText(item?.provider) === wantedProvider) score += 4;
+      if (wantedModelId && _normalizeMatchText(item?.modelId) === wantedModelId) score += 4;
+      if (wantedDuration && _normalizeMatchText(item?.duration) === wantedDuration) score += 2;
+      if (wantedRatio && _normalizeMatchText(item?.ratio) === wantedRatio) score += 2;
+      if (wantedCameraMove && _normalizeMatchText(item?.cameraMove) === wantedCameraMove) score += 1;
+      if (wantedEffectGroup && _normalizeMatchText(item?.effectGroup) === wantedEffectGroup) score += 1;
+      if (String(task?.resultName || '').trim() && _normalizeMatchText(item?.name) === _normalizeMatchText(task.resultName)) score += 2;
+      if (score <= 0) return null;
+
+      return {
+        item,
+        score,
+        timestamp: _getLibraryRowTimestamp(item),
+        itemTaskId: itemTaskId || String(item?.id || '').trim(),
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return b.timestamp - a.timestamp;
+    });
+}
+
+function _syncTaskStateFromLibrary(task, combo, usedPrimaryIds) {
+  if (!task || typeof task !== 'object') return false;
+  const candidates = _getCandidateLibraryRowsForTask(task, combo);
+  if (!candidates.length) return false;
+  const wantedTaskId = String(task.taskId || '').trim();
+  const taskIsLive = !!task.__inflight || !!task.__polling || _isTaskActuallyRunning(task);
+
+  const exactCandidates = wantedTaskId
+    ? candidates.filter((entry) => String(entry.itemTaskId || '').trim() === wantedTaskId)
+    : [];
+
+  let primary = exactCandidates.find((entry) => !usedPrimaryIds.has(entry.itemTaskId)) || null;
+  if (!primary) {
+    if (taskIsLive) {
+      return _mergeTaskRunHistoryFromCandidates(task, candidates, '');
+    }
+    primary = candidates.find((entry) => !usedPrimaryIds.has(entry.itemTaskId)) || candidates[0];
+  }
+
+  if (!primary) return false;
+  usedPrimaryIds.add(primary.itemTaskId);
+
+  const primaryItem = primary.item;
+  const exactMatch = !!wantedTaskId && String(primary.itemTaskId || '').trim() === wantedTaskId;
+  const primaryIsFinal = _isLibraryItemFinalSnapshot(primaryItem);
+  if (taskIsLive && (!exactMatch || !primaryIsFinal)) {
+    return _mergeTaskRunHistoryFromCandidates(task, candidates, primary.itemTaskId);
+  }
+  if (!exactMatch && !primaryIsFinal) {
+    return _mergeTaskRunHistoryFromCandidates(task, candidates, primary.itemTaskId);
+  }
+
+  const previousSignature = JSON.stringify({
+    taskId: String(task.taskId || '').trim(),
+    status: String(task.status || '').trim(),
+    progress: Number(task.progress || 0) || 0,
+    resultUrl: String(task.resultUrl || '').trim(),
+    qcStatus: String(task.qcStatus || '').trim(),
+    qcNote: String(task.qcNote || '').trim(),
+    runHistory: Array.isArray(task.runHistory) ? task.runHistory.length : 0,
+  });
+
+  const mappedStatus = _mapLibraryStatusToTaskStatus(primaryItem);
+  if (exactMatch || !wantedTaskId) {
+    task.taskId = String(primaryItem.taskId || primaryItem.id || '').trim();
+  }
+  task.resultUrl = String(primaryItem.resultUrl || task.resultUrl || '').trim();
+  task.resultName = String(primaryItem.name || task.resultName || '').trim() || task.resultName;
+  if (primaryIsFinal) {
+    task.status = mappedStatus;
+    task.progress = mappedStatus === 'done'
+      ? 100
+      : mappedStatus === 'fail'
+        ? 0
+        : Math.max(0, Math.min(99, Number(primaryItem.pct || primaryItem.progress || 0) || 0));
+  }
+  task.qcStatus = String(primaryItem.qcStatus || task.qcStatus || '').trim() || null;
+  task.qcNote = String(primaryItem.qcNote || primaryItem.rejectReason || task.qcNote || '').trim();
+  task.qcReviewer = String(primaryItem.qcReviewer || task.qcReviewer || '').trim();
+  task.qcReviewedAt = String(primaryItem.qcReviewedAt || task.qcReviewedAt || '').trim();
+  task.credits = Number(primaryItem.credits || task.credits || 0) || 0;
+  task.runStartedAt = String(primaryItem.createdAt || task.runStartedAt || '').trim();
+  if (primaryIsFinal && (mappedStatus === 'done' || mappedStatus === 'fail')) {
+    task.runFinishedAt = String(primaryItem.createdAt || task.runFinishedAt || '').trim();
+  }
+  if (primaryIsFinal && mappedStatus === 'fail') {
+    task.failMsg = String(primaryItem.qcNote || primaryItem.rejectReason || primaryItem.failMsg || task.failMsg || '').trim();
+  } else if (primaryIsFinal && mappedStatus === 'done') {
+    task.failMsg = '';
+  }
+
+  _mergeTaskRunHistoryFromCandidates(task, candidates, primary.itemTaskId);
+
+  const nextSignature = JSON.stringify({
+    taskId: String(task.taskId || '').trim(),
+    status: String(task.status || '').trim(),
+    progress: Number(task.progress || 0) || 0,
+    resultUrl: String(task.resultUrl || '').trim(),
+    qcStatus: String(task.qcStatus || '').trim(),
+    qcNote: String(task.qcNote || '').trim(),
+    runHistory: Array.isArray(task.runHistory) ? task.runHistory.length : 0,
+  });
+  return previousSignature !== nextSignature;
+}
+
+function _hydrateCreatorCombosFromRuntimeData() {
+  if (!Array.isArray(taskCombos) || taskCombos.length > 0) return;
+  const rows = Array.isArray(AppData?.library) ? AppData.library : [];
+  const currentSessionId = String(getCreatorSessionId() || '').trim();
+  const videoRows = rows.filter((item) => {
+    if (String(item?.type || 'video').toLowerCase() !== 'video') return false;
+    const sessionId = String(item?.sessionId || '').trim();
+    const codeTag = String(item?.codeTag || '').trim();
+    if (!sessionId || !codeTag) return false;
+    return sessionId === currentSessionId;
+  });
+  if (videoRows.length === 0) {
+    return;
+  }
+
+  const byCode = new Map();
+  videoRows.forEach((item, idx) => {
+    const codeName = _buildHistoryCodeName(item, idx + 1);
+    if (!byCode.has(codeName)) byCode.set(codeName, []);
+    byCode.get(codeName).push(item);
+  });
+
+  const combos = [];
+  let comboId = 1;
+  byCode.forEach((items, codeName) => {
+    const sortedItems = [...items].sort((a, b) => _getLibraryRowTimestamp(b) - _getLibraryRowTimestamp(a));
+    const tasks = sortedItems.map((item) => {
+      const task = createDefaultTask();
+      task.status = _mapLibraryStatusToTaskStatus(item);
+      task.taskId = String(item?.taskId || item?.id || '').trim();
+      task.resultUrl = String(item?.resultUrl || '').trim();
+      task.resultName = String(item?.name || '').trim() || (task.taskId ? `${task.taskId}.mp4` : `${codeName}_${Date.now()}.mp4`);
+      task.qcStatus = String(item?.qcStatus || item?.status || '').trim() || null;
+      task.qcNote = String(item?.qcNote || '').trim();
+      task.credits = Number(item?.credits || 0) || task.credits;
+      task.prompt = String(item?.prompt || '').trim();
+      task.provider = String(item?.provider || task.provider || getDefaultProviderId()).trim().toLowerCase() || getDefaultProviderId();
+      task.modelId = String(item?.modelId || task.modelId || getDefaultModelId(task.provider)).trim();
+      task.duration = String(item?.duration || task.duration || '5s').includes('10') ? '10s' : '5s';
+      task.ratio = String(item?.ratio || task.ratio || '9:16').trim() || '9:16';
+      task.cameraMove = String(item?.cameraMove || task.cameraMove || '-- None --').trim() || '-- None --';
+      task.effectGroup = String(item?.effectGroup || item?.effect_group || 'none').trim().toLowerCase() || 'none';
+      task.effectGroupCustom = String(item?.effectGroupDetail || item?.effect_group_detail || '').trim();
+      task.progress = task.status === 'done' ? 100 : Math.max(0, Number(item?.pct || 0));
+      task.runHistory = [];
+      applyTaskMediaProfile(task);
+      return task;
+    });
+    combos.push({
+      id: comboId++,
+      name: codeName,
+      codeTag: codeName,
+      tasks,
+      qcMode: 'individual',
+    });
+  });
+
+  if (combos.length > 0) {
+    taskCombos = combos;
+    comboCounter = combos.length;
+    activeComboIdx = 0;
+  }
+}
+
 // ---- MAIN BUILD (called by app.js) ----
 function buildCreator() {
   MODELS[0] = AppData.model;
@@ -347,43 +1209,6 @@ function buildCreator() {
         <div class="cr-tasks-area" id="tasksArea"></div>
       </div>
 
-      <!-- ===== RIGHT PANEL: DAU RA & QC (thu gon duoc) ===== -->
-      <div class="cr-panel cr-panel-right ${libraryOpen ? '' : 'collapsed'}" id="panelRight">
-        <div class="cr-panel-header">
-          <span class="cr-panel-title"><i class="fa-solid fa-photo-film"></i> &#272;&#7847;u Ra & QC</span>
-          <div style="display:flex;gap:4px;align-items:center">
-            <span class="cr-badge-count" id="libCountTop">${DEMO_LIBRARY.length}</span>
-            <button class="cr-icon-btn" onclick="toggleLibrary()" title="Thu g&#7885;n">
-              <i class="fa-solid fa-chevron-right" id="libChevron"></i>
-            </button>
-          </div>
-        </div>
-        <div class="cr-lib-body" id="libBody">
-          <div class="cr-lib-filters">
-            <select class="form-select" style="font-size:11px;flex:1" id="libFilter" onchange="renderLibrary()">
-              <option value="all">T&#7845;t c&#7843;</option>
-              <option value="video">Video</option>
-              <option value="image">&#7842;nh</option>
-              <option value="approved">&#272;&#227; duy&#7879;t</option>
-              <option value="rejected">B&#7883; t&#7915; ch&#7889;i</option>
-              <option value="pending_qc">Ch&#7901; QC</option>
-              <option value="processing">&#272;ang x&#7917; l&#253;</option>
-            </select>
-            <button class="cr-icon-btn tg" onclick="sendAllPendingQC()" title="G&#7917;i t&#7845;t c&#7843; cho QC">
-              <i class="fab fa-telegram"></i>
-            </button>
-          </div>
-          <div class="cr-lib-list" id="libList"></div>
-          <div class="cr-lib-summary" id="libSummary"></div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Library toggle when collapsed -->
-    <div class="cr-lib-toggle-collapsed ${libraryOpen ? 'hidden' : ''}" id="libToggleCollapsed" onclick="toggleLibrary()">
-      <i class="fa-solid fa-chevron-left"></i>
-      <span>&#272;&#7847;u Ra</span>
-      <span class="badge badge-orange" id="libCountBadge">${DEMO_LIBRARY.length}</span>
     </div>
 
     <!-- AI Chat Floating FAB -->
@@ -395,21 +1220,22 @@ function buildCreator() {
       <div class="ai-chat-header">
         <div style="display:flex;align-items:center;gap:8px">
           <i class="fa-solid fa-robot" style="color:var(--brand)"></i>
-          <span>Tr&#7907; l&#253; AI</span>
+          <span>Tr&#7907; l&#253; prompt</span>
         </div>
         <button class="cr-icon-btn" onclick="clearChatHistory()" style="border:none" title="X&#243;a l&#7883;ch s&#7917;"><i class="fa-solid fa-trash" style="font-size:10px;color:var(--muted)"></i></button>
         <button class="cr-icon-btn" onclick="toggleAIChat()" style="border:none" title="Thu g&#7885;n"><i class="fa-solid fa-chevron-down" id="aiChatChevron" style="font-size:10px;color:var(--muted)"></i></button>
       </div>
       <div class="ai-chat-body" id="aiChatBody">
         <div id="chatMessages" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px;max-height:640px;overflow-y:auto">
-          <div class="chat-bubble ai">Xin ch&#224;o. T&#244;i gi&#250;p b&#7841;n t&#7841;o prompt, ph&#226;n t&#237;ch &#7843;nh, t&#432; v&#7845;n quy tr&#236;nh.<br><small style="color:var(--muted)">Upload &#7843;nh &#273;&#7875; t&#244;i ph&#226;n t&#237;ch v&#224; g&#7907;i &#253; prompt.</small></div>
+          <div class="chat-bubble ai">Xin ch&#224;o. &#272;&#226;y l&#224; Tr&#7907; l&#253; prompt. T&#244;i gi&#250;p b&#7841;n t&#7841;o prompt, ph&#226;n t&#237;ch &#7843;nh, t&#432; v&#7845;n quy tr&#236;nh.<br><small style="color:var(--muted)">Ch&#7885;n &#7843;nh, nh&#7853;p c&#226;u l&#7879;nh, sau &#273;&#243; g&#7917;i c&#249;ng m&#7897;t l&#432;&#7907;t.</small></div>
         </div>
+        <div id="chatPendingAttachment" class="ai-chat-attachment" style="display:none"></div>
         <div style="display:flex;gap:6px;align-items:flex-end">
-          <button class="ai-upload-btn" onclick="document.getElementById('aiImgUpload').click()" title="Upload &#7843;nh &#273;&#7875; ph&#226;n t&#237;ch">
+          <button class="ai-upload-btn" onclick="document.getElementById('aiImgUpload').click()" title="Ch&#7885;n &#7843;nh &#273;&#237;nh k&#232;m">
             <i class="fa-solid fa-paperclip"></i>
           </button>
           <input type="file" id="aiImgUpload" accept="image/*" style="display:none" onchange="handleAIImageUpload(event)">
-          <input type="text" class="form-input" id="chatInput" placeholder="H&#7887;i tr&#7907; l&#253; AI..." style="font-size:12px;flex:1"
+          <input type="text" class="form-input" id="chatInput" placeholder="Nh&#7853;p c&#226;u l&#7879;nh cho Tr&#7907; l&#253; prompt..." style="font-size:12px;flex:1"
                  onkeydown="if(event.key==='Enter')sendChat()">
           <button class="btn-primary btn-sm" onclick="sendChat()"><i class="fa-solid fa-paper-plane"></i></button>
         </div>
@@ -419,6 +1245,9 @@ function buildCreator() {
 
   const legacyModelBox = el.querySelector('.cr-model-badge');
   if (legacyModelBox) legacyModelBox.remove();
+  const hasDraftState = loadCreatorDraftState();
+  normalizeTaskCombos();
+  if ((Array.isArray(taskCombos) ? taskCombos.length : 0) > 0) scheduleSaveCreatorDraftState(0);
 
   renderComboTabs();
   renderActiveCombo();
@@ -427,6 +1256,8 @@ function buildCreator() {
   recalcAllCosts();
   updateStatusBar();
   injectCreatorCSS();
+  ensureCreatorRealtimePolling();
+  autoPollRunningTasks();
   if (typeof loadChatHistory === 'function') loadChatHistory();
   if (!creatorAssetsLoaded) {
     loadCreatorInputAssetsFromServer().then(() => {
@@ -450,32 +1281,38 @@ function pushCreatorPresence() {
           current_entries: Array.isArray(taskCombos) ? taskCombos.map((c) => ({
             code: String(c?.name || '').trim(),
             task: `${Number(Array.isArray(c?.tasks) ? c.tasks.length : 0)} task`,
+            effect_group: String(getComboEffectSummary(c) || '').trim(),
           })).filter((entry) => entry.code) : [],
           current_entries_json: JSON.stringify(Array.isArray(taskCombos) ? taskCombos.map((c) => ({
             code: String(c?.name || '').trim(),
             task: `${Number(Array.isArray(c?.tasks) ? c.tasks.length : 0)} task`,
+            effect_group: String(getComboEffectSummary(c) || '').trim(),
           })).filter((entry) => entry.code) : []),
           current_entries_csv: (Array.isArray(taskCombos) ? taskCombos.map((c) => ({
             code: String(c?.name || '').trim(),
             task: `${Number(Array.isArray(c?.tasks) ? c.tasks.length : 0)} task`,
+            effect_group: String(getComboEffectSummary(c) || '').trim(),
           })).filter((entry) => entry.code) : []).map((entry) => `${entry.code}::${entry.task || ''}`).join('|'),
         }).catch(() => {});
       } catch (_) {}
-    }, 250);
+    }, 1200);
   } catch (_) {}
 }
 
 // ========== COMBO MANAGEMENT ==========
 function addNewCombo(silent) {
   comboCounter++;
+  const codeName = 'CODE-' + String(comboCounter).padStart(2,'0');
   const combo = {
     id: comboCounter,
-    name: 'CODE-' + String(comboCounter).padStart(2,'0'),
+    name: codeName,
+    codeTag: codeName,
     tasks: [],
     qcMode: 'individual', // individual | batch
   };
   taskCombos.push(combo);
   activeComboIdx = taskCombos.length - 1;
+  scheduleSaveCreatorDraftState(0);
   pushCreatorPresence();
   if (!silent) {
     renderComboTabs();
@@ -507,11 +1344,23 @@ function createDefaultTask() {
     cameraMove: cameraMoveList.includes('-- None --') ? '-- None --' : String(cameraMoveList[0]),
     prompt: '',
     style: presetList[0],
+    effectGroup: 'none',
+    effectGroupCustom: '',
     status: 'idle',
     progress: 0,
     resultName: null,
     qcStatus: null,
     qcNote: '',
+    qcReviewer: '',
+    qcReviewedAt: '',
+    assignedQcUser: '',
+    assignedQcDisplay: '',
+    taskId: '',
+    resultUrl: '',
+    failMsg: '',
+    runStartedAt: '',
+    runFinishedAt: '',
+    runHistory: [],
     credits: 0,
   };
   applyTaskMediaProfile(task);
@@ -537,6 +1386,13 @@ function normalizeTaskCombos() {
       const nextTask = { ...task };
       if (!nextTask.provider) nextTask.provider = getDefaultProviderId();
       if (!nextTask.modelId) nextTask.modelId = getDefaultModelId(String(nextTask.provider || '').trim().toLowerCase() || 'provider1');
+      if (!nextTask.effectGroup) nextTask.effectGroup = 'none';
+      if (typeof nextTask.effectGroupCustom !== 'string') nextTask.effectGroupCustom = '';
+      if (!Array.isArray(nextTask.runHistory)) nextTask.runHistory = [];
+      if (String(nextTask.status || '').toLowerCase() === 'running' && !String(nextTask.taskId || '').trim()) {
+        nextTask.status = 'idle';
+        nextTask.progress = 0;
+      }
       applyTaskMediaProfile(nextTask);
       nextTask.credits = calcTaskCost(nextTask);
       return nextTask;
@@ -544,6 +1400,7 @@ function normalizeTaskCombos() {
     return {
       id: combo?.id || idx + 1,
       name: String(combo?.name || `CODE-${String(idx + 1).padStart(2, '0')}`),
+      codeTag: String(combo?.codeTag || combo?.name || `CODE-${String(idx + 1).padStart(2, '0')}`),
       tasks: normalizedTasks,
       qcMode: combo?.qcMode || 'individual',
     };
@@ -577,6 +1434,7 @@ function switchCombo(idx) {
   renderComboTabs();
   renderActiveCombo();
   updateStatusBar();
+  scheduleSaveCreatorDraftState(0);
   pushCreatorPresence();
 }
 
@@ -594,6 +1452,7 @@ function removeCombo(idx) {
   renderActiveCombo();
   renderSourceImages();
   recalcAllCosts();
+  scheduleSaveCreatorDraftState(0);
   pushCreatorPresence();
 }
 
@@ -606,6 +1465,8 @@ function clearAllCombos() {
   renderActiveCombo();
   renderSourceImages();
   recalcAllCosts();
+  clearCreatorDraftState();
+  pushCreatorPresence();
   showToast('\u0110\u00E3 x\u00F3a t\u1EA5t c\u1EA3 Task Combos', 'info');
 }
 
@@ -615,6 +1476,7 @@ function renameCombo(idx) {
     taskCombos[idx].name = name.trim();
     renderComboTabs();
     renderActiveCombo();
+    scheduleSaveCreatorDraftState(0);
     pushCreatorPresence();
   }
 }
@@ -622,12 +1484,13 @@ function renameCombo(idx) {
 // ========== RENDER COMBO TABS ==========
 function renderComboTabs() {
   normalizeTaskCombos();
+  syncCreatorQCFromLibrary({ render: false });
   const el = document.getElementById('comboTabs');
   if (!el) return;
   el.innerHTML = taskCombos.map((c, i) => {
     const done = c.tasks.filter(t => t.status === 'done').length;
     const total = c.tasks.length;
-    const hasRunning = c.tasks.some(t => t.status === 'running');
+    const hasRunning = c.tasks.some((t) => _isTaskActuallyRunning(t));
     return `
       <div class="cr-combo-tab ${i === activeComboIdx ? 'active' : ''}" onclick="switchCombo(${i})" ondblclick="renameCombo(${i})">
         ${hasRunning ? '<i class="fa-solid fa-spinner fa-spin" style="font-size:10px;color:var(--brand)"></i>' : '<i class="fa-solid fa-layer-group"></i>'}
@@ -639,6 +1502,17 @@ function renderComboTabs() {
   }).join('') + `
     <button class="cr-combo-add" onclick="addNewCombo()" title="Them Task Combo"><i class="fa-solid fa-plus"></i></button>
   `;
+}
+
+function syncActiveComboTabMeta() {
+  const combo = taskCombos[activeComboIdx];
+  if (!combo) return;
+  const tab = document.querySelectorAll('.cr-combo-tab')[activeComboIdx];
+  if (!tab) return;
+  const done = combo.tasks.filter((t) => t.status === 'done').length;
+  const total = combo.tasks.length;
+  const countEl = tab.querySelector('.cr-combo-count');
+  if (countEl) countEl.textContent = `${done}/${total}`;
 }
 
 // ========== RENDER TASK TABLE ==========
@@ -663,7 +1537,8 @@ function renderActiveCombo() {
   }
   const combo = taskCombos[activeComboIdx] || taskCombos[0];
   if (!combo) return;
-  syncCreatorQCFromLibrary();
+  const isBatchRunning = !!combo.__batchRunning;
+  syncCreatorQCFromLibrary({ render: false });
 
   el.innerHTML = `
     <div class="cr-tasks-header">
@@ -679,43 +1554,36 @@ function renderActiveCombo() {
             <option value="batch" ${combo.qcMode==='batch'?'selected':''}>QC g&#7897;p 1 l&#7847;n</option>
           </select>
         </label>
-        <button class="cr-btn cr-btn-ghost" style="font-size:11px" onclick="window.addTaskRow()">
+        <button class="cr-btn cr-btn-ghost" style="font-size:11px" onclick="window.addTaskRow()" ${isBatchRunning ? 'disabled style="opacity:.6;cursor:not-allowed;font-size:11px"' : ''}>
           <i class="fa-solid fa-plus"></i> Th&#234;m D&#242;ng
         </button>
         <button class="cr-btn cr-btn-ghost" style="font-size:11px" onclick="sendComboQC()">
           <i class="fab fa-telegram"></i> G&#7917;i QC
         </button>
-        <button class="cr-btn cr-btn-run" style="font-size:11px;padding:5px 14px" onclick="runAllCombos()">
+        <button class="cr-btn cr-btn-run" style="font-size:11px;padding:5px 14px" onclick="runAllCombos()" ${isBatchRunning ? 'disabled style="font-size:11px;padding:5px 14px;opacity:.6;cursor:not-allowed"' : ''}>
           <i class="fa-solid fa-play"></i> Ch&#7841;y
         </button>
       </div>
     </div>
     <div class="cr-tasks-scroll">
-      <table class="cr-task-table">
-        <thead>
-          <tr>
-            <th>#</th>
-            <th>Ch&#7871; &#273;&#7897;</th>
-            <th>Ngu&#7891;n / Khung</th>
-            <th>Server</th>
-            <th>Model</th>
-            <th>Chi ph&#237;</th>
-            <th>T.gian</th>
-            <th>T&#7881; l&#7879;</th>
-            <th>&#272;&#7897; ph&#226;n gi&#7843;i</th>
-            <th>FPS</th>
-            <th>Chuy&#7875;n &#273;&#7897;ng</th>
-            <th>Prompt chuy&#7875;n &#273;&#7897;ng</th>
-            <th>QC</th>
-            <th>Thao t&#225;c</th>
-          </tr>
-        </thead>
-        <tbody id="taskTableBody">
+      <div class="cr-task-list">
+        <div class="cr-task-list-head">
+          <div>#</div>
+          <div>Ch&#7871; &#273;&#7897;</div>
+          <div>Ngu&#7891;n / Khung</div>
+          <div>Server</div>
+          <div>Model</div>
+          <div>Chi ph&#237;</div>
+          <div>Prompt chuy&#7875;n &#273;&#7897;ng</div>
+          <div>QC</div>
+          <div>Thao t&#225;c</div>
+        </div>
+        <div id="taskTableBody" class="cr-task-list-body">
           ${combo.tasks.length > 0
             ? combo.tasks.map((t, i) => renderTaskRow(t, i)).join('')
-            : `<tr><td colspan="14" style="padding:18px;text-align:center;color:var(--muted)">Ch&#432;a c&#243; task. B&#7845;m "Th&#234;m D&#242;ng" &#273;&#7875; t&#7841;o task m&#7899;i.</td></tr>`}
-        </tbody>
-      </table>
+            : `<div class="cr-task-empty-state">Ch&#432;a c&#243; task. B&#7845;m "Th&#234;m D&#242;ng" &#273;&#7875; t&#7841;o task m&#7899;i.</div>`}
+        </div>
+      </div>
     </div>
   `;
   pushCreatorPresence();
@@ -750,6 +1618,15 @@ function renderTaskRow(t, idx) {
     : `<span class="cr-cell-fixed" data-task-fps="${t.id}" style="font-size:11px;color:var(--text);font-weight:600">${mediaProfile.fpsDisplay}</span>`;
   const cameraMoveList = Array.isArray(CAMERA_MOVES) && CAMERA_MOVES.length ? CAMERA_MOVES : ['-- None --'];
   const camOpts = cameraMoveList.map(c => `<option ${t.cameraMove===c?'selected':''}>${c}</option>`).join('');
+  const isCustomEffect = String(t.effectGroup || 'none') === 'custom';
+  const effectOpts = VIDEO_EFFECT_GROUPS.map((row) => `<option value="${String(row.id || '').replace(/"/g, '&quot;')}" ${String(t.effectGroup || 'none') === String(row.id || '') ? 'selected' : ''}>${row.label}</option>`).join('');
+  const popupCustomEffectInput = String(t.effectGroup || 'none') === 'custom'
+    ? `<input class="cr-cell-input" style="font-size:11px;font-weight:600" placeholder="Nh\u1eadp hi\u1ec7u \u1ee9ng t\u00f9y ch\u1ecdn..." value="${String(t.effectGroupCustom || '').replace(/"/g, '&quot;')}" oninput="updateTask(${idx},'effectGroupCustom',this.value)">`
+    : '';
+  const customEffectInput = String(t.effectGroup || 'none') === 'custom'
+    ? `<input class="cr-cell-input" placeholder="Nh\u1eadp hi\u1ec7u \u1ee9ng t\u00f9y ch\u1ecdn..." value="${String(t.effectGroupCustom || '').replace(/"/g, '&quot;')}" oninput="updateTask(${idx},'effectGroupCustom',this.value)">`
+    : '';
+  const customEffectControl = customEffectInput || `<div class="cr-effect-custom-empty"></div>`;
   const costText = getTaskCostLabel(t);
 
   // Source HTML depends on mode  with drag-drop support
@@ -779,54 +1656,172 @@ function renderTaskRow(t, idx) {
       </div>`;
   }
 
+  const isSubmitting = !!t.__inflight && !String(t.taskId || '').trim();
+  const isRuntimeRunning = isSubmitting || t.status === 'running';
+  const canStartTask = _canStartTaskNow(t);
+  const isRerun = _taskHasRunHistory(t);
+  const hasResultUrl = !!String(t.resultUrl || '').trim();
+  const progressPct = Math.max(0, Math.min(100, Number(t.progress || 0) || 0));
+
   // QC status with send button
   let qcHTML;
+  const onlineQCReviewers = getOnlineQCReviewers();
   if (canSendTaskQC(t)) {
-    qcHTML = `<button class="cr-qc-send-btn" onclick="sendTaskQC(${idx})" title="G&#7917;i QC"><i class="fa-solid fa-paper-plane"></i> G&#7917;i QC</button>`;
+    const qcAssignControl = onlineQCReviewers.length
+      ? `<select class="cr-cell-select" style="min-width:120px;font-size:11px" onchange="assignTaskQCDisplay(${idx},this)">
+           <option value="">QC t&#7921; do</option>
+           <option value="__telegram__" ${String(t.assignedQcUser || '') === '__telegram__' ? 'selected' : ''}>G&#7917;i tele (Admin)</option>
+           ${onlineQCReviewers.map((row) => `<option value="${row.username.replace(/"/g, '&quot;')}" ${String(t.assignedQcUser || '') === row.username ? 'selected' : ''}>${row.display}</option>`).join('')}
+         </select>`
+      : `<span class="cr-qc-badge idle">Kh&#244;ng c&#243; QC online</span>`;
+    qcHTML = `${qcAssignControl}<button class="cr-qc-send-btn" onclick="sendTaskQC(${idx})" title="G&#7917;i QC"><i class="fa-solid fa-paper-plane"></i> G&#7917;i QC</button>`;
   } else if (t.qcStatus === 'pending_qc') {
-    qcHTML = '<span class="cr-qc-badge pending"><i class="fa-solid fa-clock"></i> Ch&#7901;</span>';
+    qcHTML = `<span class="cr-qc-badge pending"><i class="fa-solid fa-clock"></i> Ch&#7901;</span>${t.assignedQcDisplay ? `<span class="cr-qc-badge idle" title="QC &#273;&#432;&#7907;c giao">${t.assignedQcDisplay}</span>` : ''}`;
   } else if (t.qcStatus === 'approved') {
     qcHTML = '<span class="cr-qc-badge approved"><i class="fa-solid fa-check"></i> Pass</span>';
   } else if (t.qcStatus === 'rejected') {
     qcHTML = `<span class="cr-qc-badge rejected" title="${t.qcNote||''}"><i class="fa-solid fa-xmark"></i> Reject</span>`;
   } else {
-    qcHTML = '<span class="cr-qc-badge idle"></span>';
+    qcHTML = '<span class="cr-qc-badge idle">Ch&#432;a g&#7917;i</span>';
   }
 
   // Row status class
-  const rowCls = t.status === 'running' ? 'running' : t.status === 'done' ? 'done' : t.status === 'fail' ? 'fail' : '';
+  const rowCls = isRuntimeRunning ? 'running' : t.status === 'done' ? 'done' : t.status === 'fail' ? 'fail' : '';
 
   return `
-    <tr class="cr-task-row ${rowCls}" data-task="${t.id}">
-          <td class="cr-row-num" style="cursor:pointer" onclick="openTaskDetailPopup(${idx}, event)" title="Click xem chi tiet">
-        ${t.status === 'running' ? '<span class="cr-dot running"></span>' : t.status === 'done' ? '<span class="cr-dot done"></span>' : t.status === 'fail' ? '<span class="cr-dot fail"></span>' : ''}
-        ${idx + 1}
-      </td>
-      <td><select class="cr-cell-select" onchange="updateTask(${idx},'mode',this.value)">${modeOpts}</select></td>
-      <td>${sourceHTML}</td>
-      <td>${providerControl}</td>
-      <td><select class="cr-cell-select" onchange="updateTask(${idx},'modelId',this.value)">${modelOpts}</select></td>
-      <td><span class="cr-cell-fixed" data-task-cost="${t.id}" style="font-size:11px;color:var(--yellow);font-weight:700">${costText}</span></td>
-      <td><select class="cr-cell-select" onchange="updateTask(${idx},'duration',this.value)">${durOpts}</select></td>
-      <td><select class="cr-cell-select" onchange="updateTask(${idx},'ratio',this.value)">${ratioOpts}</select></td>
-      <td>${resolutionControl}</td>
-      <td>${fpsControl}</td>
-      <td><select class="cr-cell-select" onchange="updateTask(${idx},'cameraMove',this.value);autoCameraPrompt(${idx},this.value)">${camOpts}</select></td>
-      <td><textarea class="cr-cell-textarea" id="promptInput_${idx}" placeholder="camera slow pan, product rotating..." oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px';updateTask(${idx},'prompt',this.value)" onfocus="this.style.height='auto';this.style.height=this.scrollHeight+'px'">${t.prompt}</textarea></td>
-      <td>${qcHTML}</td>
-      <td>
-        <div class="cr-row-actions">
-          ${t.status==='idle' ? `<button class="cr-icon-btn run" onclick="runSingleTask(${idx})" title="Ch&#7841;y"><i class="fa-solid fa-play"></i></button>` : ''}
-          ${t.status==='running' ? `<button class="cr-icon-btn view" onclick="pollTaskStatus(${idx})" title="C&#7853;p nh&#7853;t tr&#7841;ng th&#225;i"><i class="fa-solid fa-rotate-right"></i></button><span style="font-size:9px;color:var(--brand);font-weight:700">${Math.round(t.progress)}%</span>` : ''}
-          ${t.status==='done' ? `<button class="cr-icon-btn view" onclick="previewTaskVideo(${idx})" title="Xem full video"><i class="fa-solid fa-eye"></i></button>` : ''}
-          ${t.qcStatus==='approved' ? `<button class="cr-icon-btn dl" onclick="downloadTask(${idx})" title="T&#7843;i v&#7873;"><i class="fa-solid fa-download"></i></button>` : ''}
-          <button class="cr-icon-btn del" onclick="removeTaskRow(${idx})" title="X&#243;a"><i class="fa-solid fa-trash"></i></button>
+    <div class="cr-task-row-shell" data-task-idx="${idx}">
+      <div class="cr-task-row ${rowCls}" data-task="${t.id}" data-task-idx="${idx}">
+        <div class="cr-task-wrap-cell">
+          <div class="cr-task-block ${idx % 2 === 1 ? 'is-alt' : 'is-base'}" style="cursor:pointer" onclick="openTaskDetailPopup(${idx}, event)">
+            <div class="cr-task-line cr-task-line-top">
+              <div class="cr-task-chip cr-task-chip-index" style="cursor:pointer" onclick="openTaskDetailPopup(${idx}, event)" title="Click xem chi tiet">
+                <span class="cr-task-chip-num">
+                  ${isRuntimeRunning ? '<span class="cr-dot running"></span>' : t.status === 'done' ? '<span class="cr-dot done"></span>' : t.status === 'fail' ? '<span class="cr-dot fail"></span>' : ''}
+                  <span>${idx + 1}</span>
+                </span>
+                <button class="cr-icon-btn view" onclick="event.stopPropagation();openTaskDetailPopup(${idx});return false;" title="M&#7903; chi ti&#7871;t task"><i class="fa-solid fa-up-right-and-down-left-from-center"></i></button>
+              </div>
+              <div class="cr-task-chip"><select class="cr-cell-select" onchange="updateTask(${idx},'mode',this.value)">${modeOpts}</select></div>
+              <div class="cr-task-chip cr-task-chip-source">${sourceHTML}</div>
+              <div class="cr-task-chip cr-task-chip-provider">${providerControl}</div>
+              <div class="cr-task-chip cr-task-chip-model"><select class="cr-cell-select" onchange="updateTask(${idx},'modelId',this.value)">${modelOpts}</select></div>
+              <div class="cr-task-chip cr-task-chip-cost"><span class="cr-cell-fixed" data-task-cost="${t.id}" style="font-size:11px;color:var(--yellow);font-weight:700">${costText}</span></div>
+              <div class="cr-task-chip cr-task-chip-prompt"><textarea class="cr-cell-textarea cr-cell-textarea-wide" id="promptInput_${idx}" placeholder="camera slow pan, product rotating..." oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px';updateTask(${idx},'prompt',this.value)" onfocus="this.style.height='auto';this.style.height=this.scrollHeight+'px'" onclick="event.stopPropagation()" onmousedown="event.stopPropagation()" onpointerdown="event.stopPropagation()" ontouchstart="event.stopPropagation()">${t.prompt}</textarea></div>
+              <div class="cr-task-chip cr-task-chip-qc">${qcHTML}</div>
+              <div class="cr-task-chip cr-task-chip-actions">
+                <div class="cr-row-actions">
+                  ${canStartTask ? `<button class="cr-icon-btn run" onclick="event.stopPropagation();runSingleTask(${idx});return false;" title="${isRerun ? 'Re-run' : 'Ch&#7841;y'}"><i class="fa-solid ${isRerun ? 'fa-rotate-right' : 'fa-play'}"></i></button>` : ''}
+                  ${isSubmitting ? `<button class="cr-icon-btn view" disabled title="&#272;ang g&#7917;i task"><i class="fa-solid fa-spinner fa-spin"></i></button><span style="font-size:9px;color:var(--muted);font-weight:700">&#272;ang g&#7917;i</span>` : ''}
+                  ${t.status==='running' ? `<button class="cr-icon-btn view" onclick="event.stopPropagation();pollTaskStatus(${idx});return false;" title="C&#7853;p nh&#7853;t tr&#7841;ng th&#225;i"><i class="fa-solid fa-rotate-right"></i></button>` : ''}
+                  ${(isSubmitting || isRuntimeRunning) ? `<span style="font-size:9px;color:var(--brand);font-weight:700">${isSubmitting ? '0%' : `${Math.round(progressPct)}%`}</span>` : ''}
+                  ${hasResultUrl ? `<button class="cr-icon-btn view" onclick="event.stopPropagation();previewTaskVideo(${idx});return false;" title="Xem k&#7871;t qu&#7843;"><i class="fa-solid fa-eye"></i></button>` : ''}
+                  ${t.qcStatus==='approved' ? `<button class="cr-icon-btn dl" onclick="event.stopPropagation();downloadTask(${idx});return false;" title="T&#7843;i v&#7873;"><i class="fa-solid fa-download"></i></button>` : ''}
+                  <button class="cr-icon-btn del" onclick="event.stopPropagation();removeTaskRow(${idx});return false;" title="X&#243;a"><i class="fa-solid fa-trash"></i></button>
+                </div>
+              </div>
+            </div>
+            <div class="cr-task-line cr-task-line-bottom">
+              <div class="cr-task-grid-bottom">
+                <div class="cr-task-metric cr-bottom-col5">
+                  <div class="cr-task-metric-label">Nh&#243;m hi&#7879;u &#7913;ng</div>
+                  <div class="cr-task-metric-control"><select class="cr-cell-select" onchange="updateTask(${idx},'effectGroup',this.value)">${effectOpts}</select></div>
+                </div>
+                <div class="cr-task-metric cr-bottom-col6 ${isCustomEffect ? '' : 'is-hidden'}">
+                  <div class="cr-task-metric-label">Nh&#7853;p hi&#7879;u &#7913;ng</div>
+                  <div class="cr-task-metric-control">${customEffectControl}</div>
+                </div>
+                <div class="cr-task-metric cr-bottom-col7">
+                  <div class="cr-task-metric-label">Th&#7901;i l&#432;&#7907;ng</div>
+                  <div class="cr-task-metric-control"><select class="cr-cell-select" onchange="updateTask(${idx},'duration',this.value)">${durOpts}</select></div>
+                </div>
+                <div class="cr-task-metric cr-bottom-col8">
+                  <div class="cr-task-metric-label">T&#7881; l&#7879;</div>
+                  <div class="cr-task-metric-control"><select class="cr-cell-select" onchange="updateTask(${idx},'ratio',this.value)">${ratioOpts}</select></div>
+                </div>
+                <div class="cr-task-metric cr-bottom-col9">
+                  <div class="cr-task-metric-label">&#272;&#7897; ph&#226;n gi&#7843;i</div>
+                  <div class="cr-task-metric-control">${resolutionControl}</div>
+                </div>
+                <div class="cr-task-metric cr-bottom-col10">
+                  <div class="cr-task-metric-label">FPS</div>
+                  <div class="cr-task-metric-control">${fpsControl}</div>
+                </div>
+                <div class="cr-task-metric cr-bottom-col11">
+                  <div class="cr-task-metric-label">Chuy&#7875;n &#273;&#7897;ng</div>
+                  <div class="cr-task-metric-control"><select class="cr-cell-select" onchange="updateTask(${idx},'cameraMove',this.value);autoCameraPrompt(${idx},this.value)">${camOpts}</select></div>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
-      </td>
-    </tr>
-    ${t.status === 'running' ? `<tr class="cr-progress-row"><td colspan="14"><div class="progress-bar" style="height:3px"><div class="progress-fill orange" style="width:${t.progress}%"></div></div></td></tr>` : ''}
-    ${t.qcStatus === 'rejected' && t.qcNote ? `<tr class="cr-qc-note-row"><td colspan="14"><div class="cr-qc-reason"><i class="fa-solid fa-comment-dots"></i> QC: "${t.qcNote}"</div></td></tr>` : ''}
+      </div>
+      ${isRuntimeRunning ? `<div class="cr-progress-row" data-task-idx="${idx}"><div class="progress-bar" style="height:3px"><div class="progress-fill orange" style="width:${Math.max(2, Number(t.progress || 0))}%"></div></div></div>` : ''}
+      ${t.qcStatus === 'rejected' && t.qcNote ? `<div class="cr-qc-note-row" data-task-idx="${idx}"><div class="cr-qc-reason"><i class="fa-solid fa-comment-dots"></i> QC: "${t.qcNote}"</div></div>` : ''}
+      <div class="cr-task-gap-row" data-task-idx="${idx}"></div>
+    </div>
   `;
+}
+
+function rerenderTaskRow(idx) {
+  const { combo } = getActiveComboContext();
+  const body = document.getElementById('taskTableBody');
+  if (!combo || !body || !combo.tasks[idx]) {
+    renderActiveCombo();
+    return;
+  }
+  const currentNodes = Array.from(body.querySelectorAll(`.cr-task-row-shell[data-task-idx="${idx}"]`));
+  if (!currentNodes.length) {
+    renderActiveCombo();
+    return;
+  }
+  const nextSibling = currentNodes[currentNodes.length - 1].nextSibling;
+  const temp = document.createElement('div');
+  temp.innerHTML = renderTaskRow(combo.tasks[idx], idx);
+  const newNodes = Array.from(temp.children);
+  currentNodes.forEach((node) => node.remove());
+  if (!newNodes.length) return;
+  newNodes.forEach((node) => body.insertBefore(node, nextSibling));
+  adjustAllTextareas();
+}
+
+function _getTaskIndexInCombo(task, comboRef = null) {
+  const combo = comboRef || _findTaskOwnerCombo(task) || null;
+  if (!combo || !Array.isArray(combo.tasks)) return -1;
+  return combo.tasks.indexOf(task);
+}
+
+function _refreshTaskDetailPopupByRef(task, comboRef = null) {
+  const container = document.getElementById('taskDetailPopupContainer');
+  if (!container) return;
+  const combo = comboRef || _findTaskOwnerCombo(task) || null;
+  if (!combo || combo !== taskCombos[activeComboIdx]) return;
+  const idx = _getTaskIndexInCombo(task, combo);
+  if (idx < 0) return;
+  refreshTaskDetailPopup(idx);
+}
+
+function _rerenderTaskByRef(task, comboRef = null) {
+  const combo = comboRef || _findTaskOwnerCombo(task) || null;
+  if (!combo) return;
+  if (combo !== taskCombos[activeComboIdx]) {
+    renderComboTabs();
+    updateStatusBar();
+    return;
+  }
+  const idx = _getTaskIndexInCombo(task, combo);
+  if (idx < 0) return;
+  rerenderTaskRow(idx);
+  _refreshTaskDetailPopupByRef(task, combo);
+  syncActiveComboTabMeta();
+  updateStatusBar();
+}
+
+function refreshActiveComboSurface(options = {}) {
+  renderActiveCombo();
+  syncActiveComboTabMeta();
+  if (options.withSourceImages) renderSourceImages();
+  if (options.withCosts) recalcAllCosts();
+  updateStatusBar();
 }
 
 // ========== TASK CRUD ==========
@@ -839,10 +1834,8 @@ function removeTaskRow(idx) {
   if (t.firstFrameId) unmarkImage(t.firstFrameId);
   if (t.lastFrameId) unmarkImage(t.lastFrameId);
   combo.tasks.splice(idx, 1);
-  renderActiveCombo();
-  renderComboTabs();
-  renderSourceImages();
-  recalcAllCosts();
+  refreshActiveComboSurface({ withSourceImages: true, withCosts: true });
+  scheduleSaveCreatorDraftState(0);
 }
 
 function syncTaskMetricDisplays(task) {
@@ -879,27 +1872,58 @@ function updateTask(idx, field, value) {
     applyTaskMediaProfile(t);
     t.credits = calcTaskCost(t);
     recalcAllCosts();
-    renderActiveCombo();
+    rerenderTaskRow(idx);
+    refreshTaskDetailPopup(idx);
+    scheduleSaveCreatorDraftState(0);
+    return;
+  }
+  if (field === 'effectGroup') {
+    if (String(value || '').trim().toLowerCase() !== 'custom') t.effectGroupCustom = '';
+    rerenderTaskRow(idx);
+    refreshTaskDetailPopup(idx);
+    scheduleSaveCreatorDraftState(0);
+    pushCreatorPresence();
     return;
   }
   if (field === 'modelId') {
     applyTaskMediaProfile(t);
     t.credits = calcTaskCost(t);
     recalcAllCosts();
-    renderActiveCombo();
+    rerenderTaskRow(idx);
+    refreshTaskDetailPopup(idx);
+    scheduleSaveCreatorDraftState(0);
     return;
   }
   if (field === 'duration' || field === 'resolution' || field === 'fps') {
     t.credits = calcTaskCost(t);
     syncTaskMetricDisplays(t);
     recalcAllCosts();
+    refreshTaskDetailPopup(idx);
+    scheduleSaveCreatorDraftState(0);
     return;
   }
   if (field === 'mode') {
-    renderActiveCombo();
+    rerenderTaskRow(idx);
+    refreshTaskDetailPopup(idx);
+    scheduleSaveCreatorDraftState(0);
     return;
   }
-  if (field === 'cameraMove' || field === 'ratio' || field === 'prompt') return;
+  if (field === 'cameraMove' || field === 'ratio') {
+    refreshTaskDetailPopup(idx);
+    scheduleSaveCreatorDraftState(0);
+    return;
+  }
+  if (field === 'prompt') {
+    scheduleSaveCreatorDraftState(180);
+    pushCreatorPresence();
+    return;
+  }
+  if (field === 'effectGroupCustom') {
+    scheduleSaveCreatorDraftState(0);
+    pushCreatorPresence();
+    return;
+  }
+  scheduleSaveCreatorDraftState(0);
 }
 
 function setComboQCMode(val) {
@@ -946,6 +1970,8 @@ function autoCameraPrompt(idx, cameraMove) {
     popupPrompt.style.height = 'auto';
     popupPrompt.style.height = popupPrompt.scrollHeight + 'px';
   }
+
+  scheduleSaveCreatorDraftState(0);
 
   showToast(`\u0110\u00E3 \u00E1p d\u1EE5ng prompt: ${cameraMove}`, 'success');
 }
@@ -1308,6 +2334,8 @@ async function confirmUploadRename() {
   let compressedCount = 0;
   let skippedCount = 0;
   let duplicateRenamedCount = 0;
+  const totalFiles = files.length;
+  setCreatorUploadProgress(`Đang chuẩn bị upload ${totalFiles} ảnh...`);
   const usedNameKeys = new Set();
   DEMO_IMAGES.forEach((img) => {
     usedNameKeys.add(_buildImageNameKey(String(img?.folder || ''), String(img?.name || '')));
@@ -1315,6 +2343,7 @@ async function confirmUploadRename() {
 
   for (let i = 0; i < files.length; i += 1) {
     const f = files[i];
+    setCreatorUploadProgress(`Đang xử lý ảnh ${i + 1}/${totalFiles}: ${f.name}`);
     const ext = f.name.split('.').pop();
     const num = String(i + 1).padStart(3, '0');
     let newName;
@@ -1332,6 +2361,7 @@ async function confirmUploadRename() {
     
     let uploadFile = f;
     try {
+      setCreatorUploadProgress(`Đang nén/chuẩn hóa ảnh ${i + 1}/${totalFiles}: ${f.name}`);
       const normalized = await normalizeImageForUpload(f, 20 * 1024 * 1024);
       uploadFile = normalized.file;
       if (normalized.compressed) compressedCount += 1;
@@ -1346,11 +2376,16 @@ async function confirmUploadRename() {
     let uploadedAsset = null;
     try {
       if (API && typeof API.uploadInputAsset === 'function') {
+        setCreatorUploadProgress(`Đang tải ảnh ${i + 1}/${totalFiles}: ${newName}`);
         const fd = new FormData();
-        fd.append('file', uploadFile, uploadFile.name || newName);
+        fd.append('file', uploadFile, newName);
         fd.append('session_id', sessionId);
         fd.append('code_tag', codeName);
         fd.append('folder_name', folderName.trim());
+        fd.append('file_name', newName);
+        fd.append('mime_type', uploadFile.type || '');
+        fd.append('width', String(Number(dims.width || 0)));
+        fd.append('height', String(Number(dims.height || 0)));
         const uploadResp = await API.uploadInputAsset(fd);
         if (uploadResp && uploadResp.ok && uploadResp.asset) {
           uploadedAsset = uploadResp.asset;
@@ -1374,23 +2409,11 @@ async function confirmUploadRename() {
       item.previewUrl = item.sourceUrl || localPreviewUrl;
       item.uploadedUrl = item.sourceUrl || item.uploadedUrl || '';
       DEMO_IMAGES.unshift(item);
-      try {
-        if (API && typeof API.patchInputAsset === 'function' && item.inputAssetId) {
-          await API.patchInputAsset(item.inputAssetId, {
-            file_name: newName,
-            width: Number(dims.width || 0),
-            height: Number(dims.height || 0),
-            mime_type: uploadFile.type || '',
-            session_id: sessionId,
-            code_tag: codeName,
-            folder_name: folderName.trim(),
-          });
-        }
-      } catch (_) {}
     } else {
       let legacyUploadedUrl = '';
       try {
         if (API && typeof API.uploadImage === 'function') {
+          setCreatorUploadProgress(`Đang tải ảnh ${i + 1}/${totalFiles}: ${newName}`);
           const fdLegacy = new FormData();
           fdLegacy.append('file', uploadFile, uploadFile.name || newName);
           const upLegacy = await API.uploadImage(fdLegacy);
@@ -1422,6 +2445,7 @@ async function confirmUploadRename() {
   }
 
   closeUploadRenameModal();
+  setCreatorUploadProgress('');
   renderSourceImages();
   const folderText = folderName.trim() ? `v\u00E0o th\u01B0 m\u1EE5c "${folderName.trim()}"` : '\u006E\u0068\u01B0 \u1EA3\u006E\u0068 \u006C\u1EBB';
   const uploadedCount = Math.max(0, files.length - skippedCount);
@@ -1452,9 +2476,7 @@ async function deleteSourceImage(imgId) {
       await API.deleteInputAsset(String(img.inputAssetId));
     }
     DEMO_IMAGES.splice(idx, 1);
-    renderSourceImages();
-    renderActiveCombo();
-    renderComboTabs();
+    refreshActiveComboSurface({ withSourceImages: true });
     showToast(`Đã xóa ảnh "${imgName}"`, 'success');
   } catch (err) {
     showToast(`Xóa ảnh thất bại: ${err && err.message ? err.message : 'Lỗi không xác định'}`, 'error');
@@ -1482,9 +2504,7 @@ async function deleteSourceFolder(folderName) {
   for (let i = DEMO_IMAGES.length - 1; i >= 0; i -= 1) {
     if (String(DEMO_IMAGES[i]?.folder || '').trim() === target) DEMO_IMAGES.splice(i, 1);
   }
-  renderSourceImages();
-  renderActiveCombo();
-  renderComboTabs();
+  refreshActiveComboSurface({ withSourceImages: true });
   if (failed > 0) showToast(`Đã xóa thư mục "${target}" (${failed} ảnh chưa xóa được trên server)`, 'warning');
   else showToast(`Đã xóa thư mục "${target}"`, 'success');
 }
@@ -1769,10 +2789,7 @@ function quickAssign(imgId, role) {
     task = newTask;
   }
 
-  renderSourceImages();
-  renderActiveCombo();
-  renderComboTabs();
-  recalcAllCosts();
+  refreshActiveComboSurface({ withSourceImages: true, withCosts: true });
   const taskIdx = combo.tasks.indexOf(task);
   showToast(`Đã gán "${img.name}" ở ${combo.name} Task #${taskIdx+1} (${role === 'first' ? 'Khung Đầu' : 'Khung Cuối'})`, 'success');
 }
@@ -2124,7 +3141,8 @@ function popupAssign(imgId, taskIdx, role, codeIdx) {
   closeImgPopup();
   renderSourceImages();
   renderActiveCombo();
-  renderComboTabs();
+  syncActiveComboTabMeta();
+  updateStatusBar();
   recalcAllCosts();
   showToast(`Đã gán "${img.name}" ở ${combo.name} Task #${taskIdx+1} (${role === 'first' ? 'Khung Đầu' : role === 'last' ? 'Khung Cuối' : 'I2V'})`, 'success');
 }
@@ -2147,7 +3165,8 @@ function popupNewTask(imgId, role) {
   closeImgPopup();
   renderSourceImages();
   renderActiveCombo();
-  renderComboTabs();
+  syncActiveComboTabMeta();
+  updateStatusBar();
   recalcAllCosts();
   showToast(`Tạo Task mới + "${img.name}" ở Khung ${role === 'first' ? 'Đầu' : 'Cuối'}`, 'success');
 }
@@ -2171,6 +3190,8 @@ function unassignImg(imgId) {
 
   renderSourceImages();
   renderActiveCombo();
+  syncActiveComboTabMeta();
+  updateStatusBar();
   const img = DEMO_IMAGES.find(i => i.id === imgId);
   showToast(`"${img ? img.name : 'ảnh'}" đã gỡ khỏi tất cả task`, 'info');
 }
@@ -2234,7 +3255,8 @@ function handleSrcBtnDrop(e, taskIdx, role) {
 
   renderSourceImages();
   renderActiveCombo();
-  renderComboTabs();
+  syncActiveComboTabMeta();
+  updateStatusBar();
   recalcAllCosts();
 
   const roleLabel = role === 'first' ? 'Khung Đầu' : role === 'last' ? 'Khung Cuối' : 'I2V';
@@ -2365,7 +3387,8 @@ function pickerSelectImage(imgId, taskIdx, role) {
   closeSourcePicker();
   renderSourceImages();
   renderActiveCombo();
-  renderComboTabs();
+  syncActiveComboTabMeta();
+  updateStatusBar();
   recalcAllCosts();
 
   const roleLabel = role === 'first' ? 'Khung Đầu' : role === 'last' ? 'Khung Cuối' : 'I2V';
@@ -2646,24 +3669,38 @@ function _upsertLibraryFromTask(task, combo, status, extra = {}) {
     createdAt: new Date().toISOString(),
     executionTime: task.executionTime || '-',
     resultUrl: task.resultUrl || '',
+    effectGroup: String(task.effectGroup || 'none').trim().toLowerCase() || 'none',
+    effectGroupDetail: String(task.effectGroupCustom || '').trim(),
     ...extra,
   };
   if (existing) Object.assign(existing, payload);
   else AppData.library.unshift(payload);
 }
 
-async function _runTaskReal(task) {
-  const combo = taskCombos[activeComboIdx];
+function _findTaskOwnerCombo(task) {
+  if (!task || !Array.isArray(taskCombos)) return null;
+  return taskCombos.find((combo) => Array.isArray(combo?.tasks) && combo.tasks.includes(task)) || null;
+}
+
+async function _runTaskReal(task, comboRef = null) {
+  const combo = comboRef || _findTaskOwnerCombo(task) || taskCombos[activeComboIdx];
+  if (!task || !combo) return;
+  if (task.__inflight) return;
+  _archiveCurrentTaskRun(task);
+  _resetTaskForRerun(task);
+  task.__inflight = true;
   const tIdx = combo ? combo.tasks.indexOf(task) + 1 : 1;
   const codeTag = combo ? (combo.codeTag || combo.name) : 'CODE';
   const durationNum = parseInt(String(task.duration || '5').replace('s', ''), 10) || 5;
+  const sessionId = String(getCreatorSessionId() || '').trim();
 
-  task.status = 'running';
-  task.progress = 5;
+  task.progress = 0;
+  task.failMsg = '';
+  task.runStartedAt = new Date().toISOString();
   task.resultName = `${codeTag}_T${tIdx}_${task.duration}.mp4`;
-  renderActiveCombo();
+  _applyTaskLifecycleState(task, 'submitting');
+  _rerenderTaskByRef(task, combo);
   renderComboTabs();
-  updateStatusBar();
 
   try {
     let image_url = '';
@@ -2685,30 +3722,52 @@ async function _runTaskReal(task) {
       aspect_ratio: getTaskRatioValue(task),
       provider: String(task.provider || AppData.providerSettings?.default_provider || 'provider1').trim().toLowerCase() || 'provider1',
       model_id: String(task.modelId || getDefaultModelId(String(task.provider || AppData.providerSettings?.default_provider || 'provider1').trim().toLowerCase() || 'provider1')).trim(),
+      effect_group: String(task.effectGroup || 'none').trim().toLowerCase() || 'none',
+      effect_group_detail: String(task.effectGroupCustom || '').trim(),
+      session_id: sessionId,
+      code_tag: String(combo?.codeTag || combo?.name || '').trim(),
     };
 
     const r = await API.createVideo(req);
     if (!r || !r.task_id) throw new Error('API kh\u00F4ng tr\u1EA3 task_id');
     task.taskId = r.task_id;
-    task.status = 'running';
-    task.progress = 10;
+    _applyTaskLifecycleState(task, 'running', { progress: 0 });
+    scheduleSaveCreatorDraftState(0);
     _upsertLibraryFromTask(task, combo, 'processing', { taskId: r.task_id, pct: Number(task.progress || 0) });
-    showToast(`\u0110\u00E3 g\u1EEDi task ${task.resultName}. B\u1EA5m n\u00FAt refresh \u0111\u1EC3 poll tr\u1EA1ng th\u00E1i.`, 'info');
+    pollTaskStatusByRef(task, combo, { silent: true });
+    showToast(`\u0110\u00E3 g\u1EEDi task ${task.resultName}. H\u1EC7 th\u1ED1ng \u0111ang t\u1EF1 poll tr\u1EA1ng th\u00E1i.`, 'info');
   } catch (err) {
-    task.status = 'fail';
-    task.failMsg = err && err.message ? err.message : 'G\u1EEDi task th\u1EA5t b\u1EA1i';
-    _upsertLibraryFromTask(task, combo, 'rejected', { qcNote: task.failMsg });
-    showToast(`Task th\u1EA5t b\u1EA1i: ${task.failMsg}`, 'error');
+    const normalizedFailMsg = _normalizeTaskFailureMessage(err && err.message ? err.message : 'G\u1EEDi task th\u1EA5t b\u1EA1i');
+    task.failMsg = normalizedFailMsg;
+    if (String(task.taskId || '').trim() || normalizedFailMsg === 'Hết tiền') {
+      _applyTaskLifecycleState(task, 'fail', { failMsg: normalizedFailMsg });
+    } else {
+      task.status = 'idle';
+      task.progress = 0;
+      task.__polling = false;
+      task.runFinishedAt = new Date().toISOString();
+    }
+    scheduleSaveCreatorDraftState(0);
+    if (String(task.taskId || '').trim()) {
+      _upsertLibraryFromTask(task, combo, 'rejected', { qcNote: task.failMsg });
+    }
+    showToast(task.failMsg === 'Hết tiền' ? 'Hết tiền' : `Task th\u1EA5t b\u1EA1i: ${task.failMsg}`, 'error');
+  } finally {
+    task.__inflight = false;
+    scheduleSaveCreatorDraftState(0);
   }
 
-  renderActiveCombo();
-  renderComboTabs();
-  renderLibrary();
-  updateStatusBar();
+  _rerenderTaskByRef(task, combo);
+  renderLibraryIfChanged();
 }
 
 async function runAllCombos() {
   const combo = taskCombos[activeComboIdx];
+  if (!combo) return;
+  if (combo.__batchRunning) {
+    showToast('CODE n\u00E0y \u0111ang ch\u1EA1y batch, vui l\u00F2ng ch\u1EDD xong', 'warning');
+    return;
+  }
   const waiting = combo.tasks.filter(t => t.status === 'idle');
   if (!waiting.length) { showToast('Kh\u00F4ng c\u00F3 task n\u00E0o c\u1EA7n ch\u1EA1y', 'info'); return; }
 
@@ -2723,18 +3782,31 @@ async function runAllCombos() {
   });
   if (hasError) return;
 
+  combo.__batchRunning = true;
+  refreshActiveComboSurface();
   showToast(`G\u1EEDi ${waiting.length} task l\u00EAn backend...`, 'info');
-  for (const t of waiting) {
-    await _runTaskReal(t);
+  try {
+    for (const t of waiting) {
+      if (!combo.tasks.includes(t)) continue;
+      await _runTaskReal(t, combo);
+    }
+  } finally {
+    combo.__batchRunning = false;
+    refreshActiveComboSurface();
   }
 }
 
 async function runSingleTask(idx) {
-  const task = taskCombos[activeComboIdx].tasks[idx];
-  if (!task || task.status !== 'idle') return;
+  const combo = taskCombos[activeComboIdx];
+  if (!combo) return;
+  if (combo.__batchRunning) {
+    showToast('CODE n\u00E0y \u0111ang ch\u1EA1y batch, kh\u00F4ng th\u1EC3 ch\u1EA1y l\u1EBB', 'warning');
+    return;
+  }
+  const task = combo.tasks[idx];
+  if (!task || !_canStartTaskNow(task)) return;
 
   // Enforcement: validate before run
-  const combo = taskCombos[activeComboIdx];
   const v = validateTaskBeforeRun(task, combo.name);
   if (!v.valid) {
     showToast(`Task #${idx+1}: ${v.errors.join(', ')}`, 'error');
@@ -2742,50 +3814,63 @@ async function runSingleTask(idx) {
   }
 
   showToast(`G\u1EEDi task #${idx+1} l\u00EAn backend...`, 'info');
-  await _runTaskReal(task);
+  await _runTaskReal(task, combo);
 }
 
-async function pollTaskStatus(idx) {
-  const task = taskCombos[activeComboIdx].tasks[idx];
-  if (!task || !task.taskId) {
-    showToast('Task ch\u01B0a c\u00F3 task_id \u0111\u1EC3 poll', 'warning');
+async function pollTaskStatusByRef(task, comboRef = null, options = {}) {
+  const silent = !!options?.silent;
+  const combo = comboRef || _findTaskOwnerCombo(task) || taskCombos[activeComboIdx];
+  if (!task || !combo || !task.taskId) {
+    if (!silent) showToast('Task ch\u01B0a c\u00F3 task_id \u0111\u1EC3 poll', 'warning');
     return;
   }
+  if (task.__polling) return;
+  const beforeSignature = _getTaskRuntimeSignature(task);
+  task.__polling = true;
   try {
     const r = await API.pollVideo(task.taskId);
     const state = String(r && r.state ? r.state : 'pending');
     const progress = Number(r && r.progress ? r.progress : 0) || 0;
-    task.progress = Math.max(0, Math.min(100, progress));
     if (state === 'success') {
-      task.status = 'done';
-      task.progress = 100;
+      _applyTaskLifecycleState(task, 'done', { progress: 100 });
       task.resultUrl = r.result_url || '';
-      task.failMsg = '';
-      _upsertLibraryFromTask(task, taskCombos[activeComboIdx], 'done', {
+      scheduleSaveCreatorDraftState(0);
+      _upsertLibraryFromTask(task, combo, 'done', {
         resultUrl: task.resultUrl || '',
         executionTime: task.executionTime || '-',
         pct: 100,
       });
-      showToast(`Task ho\u00E0n t\u1EA5t: ${task.resultName}`, 'success');
+      syncTaskQCStatusByRef(task, combo, { silent: true }).catch(() => {});
+      if (!silent) showToast(`Task ho\u00E0n t\u1EA5t: ${task.resultName}`, 'success');
     } else if (state === 'fail') {
-      task.status = 'fail';
-      task.failMsg = (r && r.fail_msg) || 'Task failed';
-      _upsertLibraryFromTask(task, taskCombos[activeComboIdx], 'rejected', {
+      _applyTaskLifecycleState(task, 'fail', { failMsg: (r && r.fail_msg) || 'Task failed' });
+      scheduleSaveCreatorDraftState(0);
+      _upsertLibraryFromTask(task, combo, 'rejected', {
         qcNote: task.failMsg,
       });
-      showToast(`Task th\u1EA5t b\u1EA1i: ${task.failMsg}`, 'error');
+      if (!silent) showToast(task.failMsg === 'Hết tiền' ? 'Hết tiền' : `Task th\u1EA5t b\u1EA1i: ${task.failMsg}`, 'error');
     } else {
-      task.status = 'running';
-      _upsertLibraryFromTask(task, taskCombos[activeComboIdx], 'processing', { pct: Number(task.progress || 0) });
-      showToast(`Task \u0111ang x\u1EED l\u00FD: ${Math.round(task.progress)}%`, 'info');
+      _applyTaskLifecycleState(task, 'running', { progress });
+      scheduleSaveCreatorDraftState(0);
+      _upsertLibraryFromTask(task, combo, 'processing', { pct: Number(task.progress || 0) });
+      if (!silent) showToast(`Task \u0111ang x\u1EED l\u00FD: ${Math.round(task.progress)}%`, 'info');
     }
   } catch (err) {
-    showToast(`Poll th\u1EA5t b\u1EA1i: ${err && err.message ? err.message : 'L\u1ED7i kh\u00F4ng x\u00E1c \u0111\u1ECBnh'}`, 'error');
+    if (!silent) showToast(`Poll th\u1EA5t b\u1EA1i: ${err && err.message ? err.message : 'L\u1ED7i kh\u00F4ng x\u00E1c \u0111\u1ECBnh'}`, 'error');
+  } finally {
+    task.__polling = false;
   }
-  renderActiveCombo();
-  renderComboTabs();
-  renderLibrary();
-  updateStatusBar();
+  const afterSignature = _getTaskRuntimeSignature(task);
+  if (afterSignature !== beforeSignature) {
+    _rerenderTaskByRef(task, combo);
+    renderLibraryIfChanged();
+  }
+}
+
+async function pollTaskStatus(idx, options = {}) {
+  const combo = taskCombos[activeComboIdx];
+  const task = combo?.tasks?.[idx];
+  return pollTaskStatusByRef(task, combo, options);
 }
 
 // ========== QC (with enforcement + Telegram) ==========
@@ -2805,6 +3890,21 @@ async function sendTaskQC(idx) {
     const res = await API.submitQC({
       task_id: task.taskId,
       video_url: task.resultUrl,
+      cover_url: task.coverUrl || '',
+      session_id: comboSessionId(taskCombos[activeComboIdx]) || '',
+      code_tag: taskCombos[activeComboIdx]?.name || '',
+      task_index: Number(idx || 0),
+      prompt: task.prompt || '',
+      effect_group: task.effectGroup || '',
+      effect_group_detail: task.effectGroupDetail || '',
+      provider: task.provider || '',
+      model_id: task.modelId || '',
+      gen_mode: task.mode || '',
+      duration: task.duration || '',
+      aspect_ratio: task.ratio || '',
+      credit_used: Number(task.credits || 0),
+      assigned_qc_user: task.assignedQcUser || '',
+      assigned_qc_display: task.assignedQcDisplay || '',
       note: task.qcNote || '',
     });
     if (!res || !res.ok) throw new Error('Submit QC th\u1EA5t b\u1EA1i');
@@ -2814,9 +3914,10 @@ async function sendTaskQC(idx) {
       libItem.status = 'pending_qc';
       libItem.qcStatus = 'pending_qc';
     }
+    syncTaskQCStatusByRef(task, taskCombos[activeComboIdx], { silent: true }).catch(() => {});
     renderActiveCombo();
-    renderLibrary();
-    showToast(`\u0110\u00E3 g\u1EEDi QC: ${task.resultName}. QC Manager s\u1EBD duy\u1EC7t th\u1EE7 c\u00F4ng.`, 'success');
+    renderLibraryIfChanged();
+    showToast(`\u0110\u00E3 g\u1EEDi QC: ${task.resultName}. Telegram v\u00E0 web QC \u0111\u1EC1u nh\u1EADn.`, 'success');
   } catch (err) {
     showToast(`G\u1EEDi QC th\u1EA5t b\u1EA1i: ${err && err.message ? err.message : 'L\u1ED7i kh\u00F4ng x\u00E1c \u0111\u1ECBnh'}`, 'error');
   }
@@ -2843,12 +3944,27 @@ async function sendSingleQC(libId) {
     const res = await API.submitQC({
       task_id: item.taskId,
       video_url: item.resultUrl,
+      cover_url: item.coverUrl || '',
+      session_id: item.sessionId || '',
+      code_tag: item.codeTag || '',
+      task_index: Number(item.taskIndex || 0),
+      prompt: item.prompt || '',
+      effect_group: item.effectGroup || '',
+      effect_group_detail: item.effectGroupDetail || '',
+      provider: item.provider || '',
+      model_id: item.modelId || '',
+      gen_mode: item.genMode || item.mode || '',
+      duration: item.duration || '',
+      aspect_ratio: item.ratio || item.aspectRatio || '',
+      credit_used: Number(item.credits || 0),
+      assigned_qc_user: item.assignedQcUser || '',
+      assigned_qc_display: item.assignedQcDisplay || '',
       note: item.qcNote || '',
     });
     if (!res || !res.ok) throw new Error('Submit QC th\u1EA5t b\u1EA1i');
     item.status = 'pending_qc';
     item.qcStatus = 'pending_qc';
-    renderLibrary();
+    renderLibraryIfChanged();
     showToast(`\u0110\u00E3 g\u1EEDi QC: ${item.name}`, 'success');
   } catch (err) {
     showToast(`G\u1EEDi QC th\u1EA5t b\u1EA1i: ${err && err.message ? err.message : 'L\u1ED7i kh\u00F4ng x\u00E1c \u0111\u1ECBnh'}`, 'error');
@@ -2865,9 +3981,33 @@ async function sendAllPendingQC() {
 
 function canSendTaskQC(t) {
   if (!t) return false;
-  if (t.status !== 'done') return false;
+  if (!_isFinalTaskState(t.status, t.qcStatus)) return false;
+  if (String(t.status || '').trim().toLowerCase() === 'fail') return false;
   if (!t.taskId || !t.resultUrl) return false;
-  return t.qcStatus !== 'pending_qc';
+  const qc = String(t.qcStatus || '').trim().toLowerCase();
+  return qc !== 'pending_qc' && qc !== 'approved' && qc !== 'rejected';
+}
+
+function getOnlineQCReviewers() {
+  return getActiveSessions()
+    .filter((row) => String(row.role || '').trim().toLowerCase() === 'qc_manager')
+    .map((row) => ({
+      username: String(row.username || row.staffId || '').trim(),
+      display: String(row.displayName || row.display_name || row.username || '').trim(),
+    }))
+    .filter((row) => row.username)
+    .filter((row, idx, arr) => arr.findIndex((x) => x.username === row.username) === idx);
+}
+
+function assignTaskQCDisplay(idx, selectEl) {
+  const combo = taskCombos[activeComboIdx];
+  const task = combo?.tasks?.[idx];
+  if (!task || !selectEl) return;
+  const option = selectEl.options && selectEl.selectedIndex >= 0 ? selectEl.options[selectEl.selectedIndex] : null;
+  task.assignedQcUser = String(selectEl.value || '').trim();
+  task.assignedQcDisplay = task.assignedQcUser ? String(option?.text || '').trim() : '';
+  if (task.assignedQcUser === '__telegram__') task.assignedQcDisplay = 'Telegram/Admin';
+  scheduleSaveCreatorDraftState(0);
 }
 
 function canSendLibraryQC(item) {
@@ -2875,39 +4015,43 @@ function canSendLibraryQC(item) {
   const mediaType = String(item.type || item.media_type || 'video').toLowerCase();
   if (mediaType !== 'video') return false;
   if (!item.taskId || !item.resultUrl) return false;
-  return item.status !== 'processing' && item.status !== 'pending_qc';
+  if (!_isFinalTaskState(item.status, item.qcStatus)) return false;
+  const status = String(item.status || '').trim().toLowerCase();
+  const qc = String(item.qcStatus || '').trim().toLowerCase();
+  if (status === 'fail') return false;
+  return qc !== 'pending_qc' && qc !== 'approved' && qc !== 'rejected';
 }
 
-function syncCreatorQCFromLibrary() {
+function syncCreatorQCFromLibrary(options = {}) {
+  const shouldRender = options?.render !== false;
+  const usedPrimaryIds = new Set();
+  let changed = false;
   for (const combo of taskCombos) {
     for (const t of combo.tasks) {
-      if (!t || !t.taskId) continue;
-      const lib = AppData.library.find(i => i.taskId === t.taskId || i.id === t.taskId);
-      if (!lib) continue;
-      const libQc = String(lib.qcStatus || lib.status || '').toLowerCase();
-      if (libQc === 'pending_qc' || libQc === 'approved' || libQc === 'rejected') {
-        t.qcStatus = libQc;
-      }
-      if (lib.qcNote) t.qcNote = lib.qcNote;
+      if (!t) continue;
+      if (_syncTaskStateFromLibrary(t, combo, usedPrimaryIds)) changed = true;
     }
   }
+  if (changed) {
+    scheduleSaveCreatorDraftState(0);
+    if (shouldRender) {
+      renderComboTabs();
+      renderActiveCombo();
+      renderLibraryIfChanged();
+      updateStatusBar();
+    }
+  }
+  return changed;
 }
 
 // ========== LIBRARY / OUTPUT PANEL ==========
 function toggleLibrary() {
-  libraryOpen = !libraryOpen;
-  const panel = document.getElementById('panelRight');
-  const chevron = document.getElementById('libChevron');
-  const toggle = document.getElementById('libToggleCollapsed');
-  if (panel) panel.classList.toggle('collapsed', !libraryOpen);
-  if (chevron) chevron.className = libraryOpen ? 'fa-solid fa-chevron-right' : 'fa-solid fa-chevron-left';
-  if (toggle) toggle.classList.toggle('hidden', libraryOpen);
+  libraryOpen = true;
 }
 
 function openLibraryItem(libId) {
   const item = DEMO_LIBRARY.find(i => i.id === libId);
   if (!item) return;
-  if (!libraryOpen) toggleLibrary();
 
   const qcStaff = item.qcById ? getStaff(item.qcById) : null;
   const qcReviewer = item.qcReviewer || (qcStaff ? qcStaff.name : '-');
@@ -3063,6 +4207,7 @@ function renderLibrary() {
   `;
   if (badge) badge.textContent = total;
   if (topBadge) topBadge.textContent = total;
+  creatorLastLibraryRenderSignature = _getLibraryRenderSignature();
 }
 
 // ========== COSTS & STATUS ==========
@@ -3082,6 +4227,14 @@ function recalcAllCosts() {
     if (totalUsd > 0) parts.push(`$${totalUsd.toFixed(2)}`);
     el.textContent = parts.length ? parts.join(' + ') : '0';
   }
+}
+
+function scheduleRecalcAllCosts(delay = 0) {
+  if (recalcAllCostsTimer) clearTimeout(recalcAllCostsTimer);
+  recalcAllCostsTimer = setTimeout(() => {
+    recalcAllCostsTimer = 0;
+    recalcAllCosts();
+  }, Math.max(0, Number(delay || 0)));
 }
 
 function updateStatusBar() {
@@ -3176,16 +4329,11 @@ function injectCreatorCSS() {
     .cr-workspace { display:flex; flex:1; overflow:hidden; min-height:0; }
     .cr-panel { display:flex; flex-direction:column; overflow:hidden; }
     .cr-panel-left { width:420px; min-width:420px; max-width:420px; background:var(--bg); border-right:1px solid var(--border); flex-shrink:0; overflow:hidden; }
-    .cr-panel-center { flex:1; min-width:0; background:var(--bg2); display:flex; flex-direction:column; }
-    .cr-panel-right { width:270px; min-width:270px; background:var(--bg); border-left:1px solid var(--border); flex-shrink:0; transition:width .25s,min-width .25s; }
-    .cr-panel-right.collapsed { width:0; min-width:0; border-left:none; overflow:hidden; }
+    .cr-panel-center { flex:1; min-width:0; min-height:0; background:var(--bg2); display:flex; flex-direction:column; overflow:hidden; }
+    .cr-tasks-area { flex:1; min-height:0; display:flex; flex-direction:column; overflow:hidden; }
     .cr-panel-header { display:flex; align-items:center; justify-content:space-between; padding:8px 12px; border-bottom:1px solid var(--border); flex-shrink:0; }
     .cr-panel-title { font-size:12px; font-weight:700; display:flex; align-items:center; gap:6px; }
 
-    /* Library collapsed toggle */
-    .cr-lib-toggle-collapsed { position:fixed; right:0; top:50%; transform:translateY(-50%); background:var(--card); border:1px solid var(--border); border-right:none; border-radius:8px 0 0 8px; padding:10px 8px; cursor:pointer; z-index:100; display:flex; flex-direction:column; align-items:center; gap:6px; font-size:10px; color:var(--muted); transition:.15s; }
-    .cr-lib-toggle-collapsed:hover { background:var(--brand-dim); color:var(--brand); }
-    .cr-lib-toggle-collapsed.hidden { display:none; }
 
     /* ===== SOURCE PANEL ===== */
     .cr-source-tabs { display:flex; border-bottom:1px solid var(--border); }
@@ -3246,7 +4394,7 @@ function injectCreatorCSS() {
     .cr-grid-usage-tag.i2v { background:rgba(74,158,232,.12); color:var(--blue); border:1px solid rgba(74,158,232,.25); }
 
     /* ===== IMAGE POPUP ===== */
-    .cr-popup-overlay { position:fixed; inset:0; background:rgba(0,0,0,.35); z-index:999; backdrop-filter:blur(2px); animation:crPopFade .15s ease; }
+    .cr-popup-overlay { position:fixed; inset:0; background:rgba(0,0,0,.35); z-index:999; }
     @keyframes crPopFade { from{opacity:0} to{opacity:1} }
     .cr-popup { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%) scale(.92); background:var(--card); border:1px solid var(--border); border-radius:14px; box-shadow:0 12px 48px rgba(0,0,0,.5); z-index:1000; width:520px; max-height:80vh; display:flex; flex-direction:column; opacity:0; transition:transform .2s cubic-bezier(.34,1.56,.64,1), opacity .15s ease; }
     .cr-popup.show { opacity:1; transform:translate(-50%,-50%) scale(1); }
@@ -3320,29 +4468,46 @@ function injectCreatorCSS() {
     /* ===== TASK TABLE ===== */
     .cr-tasks-header { display:flex; align-items:center; justify-content:space-between; padding:8px 14px; flex-shrink:0; gap:8px; }
     .cr-tasks-title { font-size:13px; font-weight:700; display:flex; align-items:center; gap:6px; }
-    .cr-tasks-scroll { flex:1; overflow-y:auto; overflow-x:hidden; padding:0 8px; }
-    .cr-task-table { width:100%; min-width:0; border-collapse:collapse; table-layout:fixed; }
-    .cr-task-table thead th { padding:6px 5px; font-size:10px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.4px; border-bottom:1px solid var(--border); text-align:left; position:sticky; top:0; background:var(--bg2); z-index:2; white-space:normal; word-break:break-word; }
-    .cr-task-row td { padding:5px 5px; border-bottom:1px solid rgba(58,58,60,.4); vertical-align:middle; min-width:0; }
-    .cr-task-row td { overflow:hidden; }
-    .cr-task-table th:nth-child(1), .cr-task-table td:nth-child(1) { width:3%; }
-    .cr-task-table th:nth-child(2), .cr-task-table td:nth-child(2) { width:8%; }
-    .cr-task-table th:nth-child(3), .cr-task-table td:nth-child(3) { width:11%; }
-    .cr-task-table th:nth-child(4), .cr-task-table td:nth-child(4) { width:9%; }
-    .cr-task-table th:nth-child(5), .cr-task-table td:nth-child(5) { width:12%; }
-    .cr-task-table th:nth-child(6), .cr-task-table td:nth-child(6) { width:6%; }
-    .cr-task-table th:nth-child(7), .cr-task-table td:nth-child(7) { width:6%; }
-    .cr-task-table th:nth-child(8), .cr-task-table td:nth-child(8) { width:6%; }
-    .cr-task-table th:nth-child(9), .cr-task-table td:nth-child(9) { width:7%; }
-    .cr-task-table th:nth-child(10), .cr-task-table td:nth-child(10) { width:4%; }
-    .cr-task-table th:nth-child(11), .cr-task-table td:nth-child(11) { width:10%; }
-    .cr-task-table th:nth-child(12), .cr-task-table td:nth-child(12) { width:12%; }
-    .cr-task-table th:nth-child(13), .cr-task-table td:nth-child(13) { width:3%; }
-    .cr-task-table th:nth-child(14), .cr-task-table td:nth-child(14) { width:3%; }
-    .cr-task-row:hover td { background:rgba(255,255,255,.015); }
-    .cr-task-row.running td { background:rgba(217,122,43,.04); }
-    .cr-task-row.done td { background:rgba(95,184,95,.025); }
-    .cr-task-row.fail td { background:rgba(224,85,85,.025); }
+    .cr-tasks-scroll { flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; padding:0 8px; }
+    .cr-task-list { width:100%; min-width:0; --cr-task-grid-columns:64px 118px 146px 108px 144px 72px minmax(260px,1fr) 84px 92px; }
+    .cr-task-list-head { display:grid; grid-template-columns:var(--cr-task-grid-columns); gap:8px; padding:6px 10px; position:sticky; top:0; z-index:2; background:var(--bg2); border-bottom:1px solid var(--border); color:var(--muted); font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.4px; }
+    .cr-task-list-body { display:flex; flex-direction:column; }
+    .cr-task-empty-state { padding:18px; text-align:center; color:var(--muted); }
+    .cr-task-row-shell { display:flex; flex-direction:column; }
+    .cr-task-row { display:block; }
+    .cr-task-wrap-cell { padding:6px 6px 0 !important; overflow:visible !important; }
+    .cr-task-row-fallback { margin:8px 6px; padding:12px 14px; border:1px solid rgba(224,85,85,.28); border-left:4px solid var(--red); border-radius:12px; background:rgba(224,85,85,.08); color:var(--red); font-size:12px; }
+    .cr-upload-progress { position:absolute; left:50%; bottom:14px; transform:translateX(-50%); z-index:25; padding:8px 12px; border-radius:10px; border:1px solid var(--border); background:rgba(17,17,17,.94); color:var(--text); font-size:11px; box-shadow:0 10px 24px rgba(0,0,0,.28); }
+    .cr-task-block { display:flex; flex-direction:column; gap:8px; width:100%; padding:12px 14px; background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.12); border-left:4px solid rgba(74,158,232,.65); border-radius:12px; transition:border-color .12s ease, box-shadow .12s ease, background .12s ease; }
+    .cr-task-block.is-alt { background:rgba(217,122,43,.1); border-color:rgba(217,122,43,.28); border-left-color:rgba(217,122,43,.95); }
+    .cr-task-block:hover { border-color:rgba(217,122,43,.4); border-left-color:var(--brand); box-shadow:0 4px 14px rgba(0,0,0,.18); }
+    .cr-task-line { display:flex; align-items:center; gap:8px; min-width:0; flex-wrap:nowrap; }
+    .cr-task-line-top { display:grid; grid-template-columns:var(--cr-task-grid-columns); align-items:start; }
+    .cr-task-line-bottom { padding-left:0; border-top:1px solid rgba(58,58,60,.45); padding-top:8px; justify-content:flex-start; }
+    .cr-task-grid-bottom { display:flex; width:100%; max-width:100%; gap:10px; align-items:flex-end; flex-wrap:wrap; }
+    .cr-task-metric { display:flex; flex-direction:column; gap:4px; min-width:0; }
+    .cr-task-metric.is-hidden { display:none; }
+    .cr-task-metric-label { font-size:10px; color:var(--muted); font-weight:700; line-height:1.1; white-space:nowrap; }
+    .cr-task-metric-control { min-width:0; }
+    .cr-bottom-col5 { width:150px; }
+    .cr-bottom-col6 { width:150px; }
+    .cr-bottom-col7 { width:76px; }
+    .cr-bottom-col8 { width:76px; }
+    .cr-bottom-col9 { width:84px; }
+    .cr-bottom-col10 { width:44px; }
+    .cr-bottom-col11 { width:160px; }
+    .cr-task-chip { display:flex; align-items:center; gap:6px; min-width:0; width:100%; }
+    .cr-task-chip-index { justify-content:flex-start; gap:10px; }
+    .cr-task-chip-num { min-width:26px; justify-content:flex-start; font-weight:700; color:var(--muted); display:flex; align-items:center; gap:4px; }
+    .cr-task-chip-source { min-width:0; max-width:none; }
+    .cr-task-chip-provider { min-width:0; max-width:none; }
+    .cr-task-chip-model { min-width:0; max-width:none; }
+    .cr-task-chip-cost { min-width:0; justify-content:flex-start; }
+    .cr-task-chip-prompt { min-width:0; }
+    .cr-task-chip-qc { min-width:0; justify-content:flex-start; }
+    .cr-task-chip-actions { min-width:0; justify-content:flex-end; }
+    .cr-task-chip-motion { min-width:220px; max-width:280px; }
+    .cr-task-label-inline { font-size:10px; color:var(--muted); font-weight:700; text-transform:uppercase; letter-spacing:.3px; }
     .cr-row-num { font-size:12px; font-weight:700; color:var(--muted); text-align:center; white-space:nowrap; }
     .cr-dot { display:inline-block; width:6px;height:6px;border-radius:50%;margin-right:3px;vertical-align:middle; }
     .cr-dot.running { background:var(--brand); animation:crpulse 1s infinite; }
@@ -3357,10 +4522,11 @@ function injectCreatorCSS() {
     .cr-src-btn.filled { border-color:rgba(95,184,95,.3); color:var(--green); }
     .cr-src-label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:80px; }
     .cr-flf-btns { display:flex; gap:4px; }
-    .cr-src-btn.mini { width:auto; flex:1; justify-content:center; padding:4px; }
+    .cr-src-btn.mini { width:auto; min-width:44px; min-height:32px; flex:1; justify-content:center; padding:6px 10px; font-size:11px; font-weight:700; }
     .cr-row-actions { display:flex; gap:3px; align-items:center; justify-content:flex-start; flex-wrap:nowrap; }
-    .cr-progress-row td { padding:0 !important; border-bottom:none !important; }
-    .cr-qc-note-row td { padding:2px 6px !important; border-bottom:1px solid var(--border) !important; }
+    .cr-progress-row { padding:0 6px; }
+    .cr-qc-note-row { padding:2px 10px 0 10px; }
+    .cr-task-gap-row { height:10px !important; }
     .cr-qc-reason { font-size:10px; color:var(--red); font-style:italic; display:flex; align-items:center; gap:4px; padding:2px 0; }
 
     /* ===== QC BADGES ===== */
@@ -3409,6 +4575,14 @@ function injectCreatorCSS() {
 
     .ai-upload-btn { width:34px; height:34px; border-radius:8px; border:1px solid var(--border); background:var(--bg2); color:var(--muted); cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:14px; transition:.15s; flex-shrink:0; }
     .ai-upload-btn:hover { border-color:var(--brand); color:var(--brand); background:var(--brand-dim); }
+    .ai-chat-attachment { display:flex; align-items:center; gap:10px; padding:8px 10px; margin-bottom:8px; border:1px solid rgba(217,122,43,.24); background:rgba(217,122,43,.07); border-radius:10px; }
+    .ai-chat-attachment-thumb { width:42px; height:42px; border-radius:8px; overflow:hidden; flex-shrink:0; background:var(--bg2); display:flex; align-items:center; justify-content:center; }
+    .ai-chat-attachment-thumb img { width:100%; height:100%; object-fit:cover; display:block; }
+    .ai-chat-attachment-meta { min-width:0; flex:1; display:flex; flex-direction:column; gap:2px; }
+    .ai-chat-attachment-title { font-size:11px; font-weight:700; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .ai-chat-attachment-sub { font-size:10px; color:var(--muted); }
+    .ai-chat-attachment-clear { width:28px; height:28px; border-radius:8px; border:1px solid var(--border); background:var(--bg2); color:var(--muted); display:flex; align-items:center; justify-content:center; cursor:pointer; transition:.15s; flex-shrink:0; }
+    .ai-chat-attachment-clear:hover { border-color:var(--red); color:var(--red); background:rgba(196,74,58,.08); }
     .ai-chat-img-thumb { width:60px; height:60px; border-radius:8px; overflow:hidden; margin-bottom:4px; }
     .ai-chat-img-thumb img { width:100%; height:100%; object-fit:cover; display:block; }
     .ai-prompt-suggestion { background:rgba(217,122,43,.08); border:1px solid rgba(217,122,43,.2); border-radius:6px; padding:6px 8px; font-size:11px; color:var(--brand); cursor:pointer; transition:.15s; line-height:1.4; margin-bottom:4px; }
@@ -3470,6 +4644,7 @@ function injectCreatorCSS() {
 
     .cr-cell-input { width:100%; height:28px; background:var(--bg2); border:1px solid var(--border); border-radius:4px; padding:0 8px; font-size:11px; color:var(--text); transition:.15s; }
     .cr-cell-textarea { width:100%; max-width:100%; min-width:0; height:28px; min-height:28px; background:var(--bg2); border:1px solid var(--border); border-radius:4px; padding:4px 8px; font-size:11px; color:var(--text); transition:.15s; resize:none; overflow:hidden; line-height:1.4; box-sizing:border-box; word-break:break-word; }
+    .cr-cell-textarea-wide { min-height:38px; height:38px; width:100%; }
     .cr-cell-input:focus, .cr-cell-textarea:focus { border-color:var(--brand); background:var(--bg); outline:none; }
 
     .cr-qc-mode select { background:var(--card); border:1px solid var(--border); color:var(--muted); border-radius:4px; }
@@ -3493,7 +4668,6 @@ function injectCreatorCSS() {
 
     @media (max-width: 1536px) {
       .cr-panel-left { width:360px; min-width:360px; max-width:360px; }
-      .cr-panel-right { width:240px; min-width:240px; }
       .ai-chat-panel { width:min(520px, calc(100vw - 40px)); }
     }
 
@@ -3501,17 +4675,21 @@ function injectCreatorCSS() {
       .cr-topbar { flex-wrap:wrap; align-items:flex-start; }
       .cr-topbar-left, .cr-topbar-actions { width:100%; }
       .cr-workspace { flex-direction:column; overflow:auto; }
-      .cr-panel-left, .cr-panel-center, .cr-panel-right { width:100%; min-width:0; max-width:none; border-left:none; border-right:none; }
+      .cr-panel-left, .cr-panel-center { width:100%; min-width:0; max-width:none; border-left:none; border-right:none; }
       .cr-panel-left { max-height:42vh; border-bottom:1px solid var(--border); }
       .cr-panel-center { min-height:46vh; }
-      .cr-panel-right { border-top:1px solid var(--border); }
-      .cr-panel-right.collapsed { width:100%; min-width:0; height:0; }
-      .cr-lib-toggle-collapsed { right:14px; bottom:84px; }
       .cr-picker-grid { grid-template-columns:repeat(3, minmax(0,1fr)); }
       .ai-chat-panel { width:min(460px, calc(100vw - 32px)); right:16px; bottom:16px; }
       .cr-popup.cr-popup-wide { width:min(1100px, calc(100vw - 32px)); }
       .cr-popup-layout { flex-direction:column; }
       .cr-popup-preview { width:100%; min-width:0; border-left:none; border-top:1px solid var(--border); max-height:40vh; }
+      .cr-task-line { flex-wrap:wrap; }
+      .cr-task-line-top { display:flex; }
+      .cr-task-line-bottom { padding-left:0; }
+      .cr-task-grid-bottom { grid-template-columns:1fr 1fr; }
+      .cr-bottom-col5,.cr-bottom-col6,.cr-bottom-col7,.cr-bottom-col8,.cr-bottom-col9,.cr-bottom-col10,.cr-bottom-col11,.cr-bottom-col12 { grid-column:auto; }
+      .cr-task-chip-prompt { min-width:260px; }
+      .cr-task-chip-motion { min-width:220px; }
     }
 
     @media (max-width: 768px) {
@@ -3521,20 +4699,27 @@ function injectCreatorCSS() {
       .cr-model-select { width:100%; }
       .cr-panel-header { padding:10px 12px; }
       .cr-source-toolbar, .cr-lib-filters, .cr-combo-tabs, .cr-tasks-header, .cr-status-bar { flex-wrap:wrap; }
-      .cr-task-table { width:100%; min-width:0; }
+      .cr-task-list { width:100%; min-width:0; }
       .cr-tasks-scroll, .cr-lib-list, .cr-source-body { -webkit-overflow-scrolling:touch; }
       .cr-picker-grid { grid-template-columns:repeat(2, minmax(0,1fr)); }
       .ai-chat-panel { width:calc(100vw - 24px); right:12px; bottom:12px; max-height:80vh; }
       .cr-popup { width:calc(100vw - 20px); max-width:calc(100vw - 20px); max-height:84vh; }
       .cr-popup.show { transform:translate(-50%,-50%) scale(1); }
       .cr-popup-body { padding:12px; }
+      .cr-task-line { flex-wrap:wrap; gap:6px; }
+      .cr-task-line-top { display:flex; }
+      .cr-task-chip-source, .cr-task-chip-provider, .cr-task-chip-model, .cr-task-chip-motion, .cr-task-chip-prompt { min-width:100%; max-width:none; }
+      .cr-task-chip-actions { min-width:100%; justify-content:flex-start; }
+      .cr-task-line-bottom { padding-left:0; }
+      .cr-task-grid-bottom { grid-template-columns:1fr; }
+      .cr-bottom-col5,.cr-bottom-col6,.cr-bottom-col7,.cr-bottom-col8,.cr-bottom-col9,.cr-bottom-col10,.cr-bottom-col11,.cr-bottom-col12 { grid-column:auto; }
     }
 
     @media (max-width: 576px) {
       .cr-upload-zone { padding:16px 12px; }
       .cr-btn, .cr-btn-primary, .cr-btn-ghost, .cr-btn-run { font-size:11px; padding:7px 10px; }
       .cr-picker-grid { grid-template-columns:repeat(2, minmax(0,1fr)); gap:6px; }
-      .cr-task-table { width:100%; min-width:0; }
+      .cr-task-list { width:100%; min-width:0; }
       .cr-lib-summary { flex-wrap:wrap; }
       .cr-status-bar { gap:8px; padding:6px 10px; }
       .ai-fab { width:46px; height:46px; right:14px; bottom:14px; }
@@ -3545,12 +4730,9 @@ function injectCreatorCSS() {
 }
 
 // ========== TASK DETAIL POPUP ==========
-function openTaskDetailPopup(idx, event) {
+function openTaskDetailPopup(idx, event, preserveContainer) {
   // Prevent popup if clicking interactive elements
-  if (event && event.target && event.target.closest && event.target.closest('select, input, button, .cr-icon-btn, .cr-src-btn')) return;
-
-  // CRITICAL FIX: Always close existing popup first to prevent stacking
-  closeTaskDetailPopup();
+  if (!preserveContainer && event && event.target && event.target.closest && event.target.closest('select, input, textarea, button, .cr-icon-btn, .cr-src-btn, .cr-cell-textarea')) return;
 
   const combo = taskCombos[activeComboIdx];
   if (!combo) return;
@@ -3594,6 +4776,11 @@ function openTaskDetailPopup(idx, event) {
     rejected: { label: 'T&#7915; ch&#7889;i', cls: 'rejected', icon: 'fa-xmark' },
   };
   const qc = t.qcStatus ? (qcMap[t.qcStatus] || { label: '', cls: 'idle', icon: '' }) : { label: 'Ch&#432;a g&#7917;i', cls: 'idle', icon: '' };
+  const qcReason = String(t.qcNote || '').trim();
+  const qcReviewer = String(t.qcReviewer || '').trim();
+  const canStartTask = _canStartTaskNow(t);
+  const isRerun = _taskHasRunHistory(t);
+  const runHistoryHtml = _renderTaskRunHistory(t);
 
   // Frame thumbnails
   let framesHtml = '';
@@ -3631,6 +4818,10 @@ function openTaskDetailPopup(idx, event) {
 
   const cameraMoveList = Array.isArray(CAMERA_MOVES) && CAMERA_MOVES.length ? CAMERA_MOVES : ['-- None --'];
   const camOpts = cameraMoveList.map(c => `<option ${t.cameraMove===c?'selected':''}>${c}</option>`).join('');
+  const effectOpts = VIDEO_EFFECT_GROUPS.map((row) => `<option value="${String(row.id || '').replace(/"/g, '&quot;')}" ${String(t.effectGroup || 'none') === String(row.id || '') ? 'selected' : ''}>${row.label}</option>`).join('');
+  const popupCustomEffectInput = String(t.effectGroup || 'none') === 'custom'
+    ? `<input class="cr-cell-input" style="font-size:11px;font-weight:600" placeholder="Nh\u1eadp hi\u1ec7u \u1ee9ng t\u00f9y ch\u1ecdn..." value="${String(t.effectGroupCustom || '').replace(/"/g, '&quot;')}" oninput="updateTask(${idx},'effectGroupCustom',this.value)">`
+    : '';
   const providerRows = getProviderCatalogRows();
   const selectedProvider = String(t.provider || getDefaultProviderId()).trim().toLowerCase() || 'provider1';
   const selectedProviderRow = getProviderRow(selectedProvider);
@@ -3640,13 +4831,13 @@ function openTaskDetailPopup(idx, event) {
   const mediaProfile = applyTaskMediaProfile(t);
   const modelOpts = modelRows.map((row) => `<option value="${String(row.id || '').replace(/"/g, '&quot;')}" ${String(row.id || '') === selectedModelId ? 'selected' : ''}>${String(row.label || row.id || '')}</option>`).join('');
   const providerPopupControl = canChangeTaskProvider()
-    ? `<select class="cr-cell-select" style="font-size:11px;font-weight:600" onchange="updateTask(${idx},'provider',this.value);setTimeout(()=>openTaskDetailPopup(${idx}),50)">${providerOpts}</select>`
+    ? `<select class="cr-cell-select" style="font-size:11px;font-weight:600" onchange="updateTask(${idx},'provider',this.value)">${providerOpts}</select>`
     : `<div style="font-size:11px;font-weight:600;color:var(--text);padding:3px 0">${String(selectedProviderRow?.name || selectedProvider || '-')}</div>`;
   const popupResolutionControl = mediaProfile.resolutionOptions.length > 1
-    ? `<select class="cr-cell-select" style="font-size:11px;font-weight:600" onchange="updateTask(${idx},'resolution',this.value);setTimeout(()=>openTaskDetailPopup(${idx}),50)">${mediaProfile.resolutionOptions.map((value) => `<option value="${String(value).replace(/"/g, '&quot;')}" ${mediaProfile.resolution === value ? 'selected' : ''}>${value}</option>`).join('')}</select>`
+    ? `<select class="cr-cell-select" style="font-size:11px;font-weight:600" onchange="updateTask(${idx},'resolution',this.value)">${mediaProfile.resolutionOptions.map((value) => `<option value="${String(value).replace(/"/g, '&quot;')}" ${mediaProfile.resolution === value ? 'selected' : ''}>${value}</option>`).join('')}</select>`
     : `<div data-task-resolution="${t.id}" style="font-size:11px;font-weight:600;color:var(--text);padding:3px 0">${mediaProfile.resolutionDisplay}</div>`;
   const popupFpsControl = mediaProfile.fpsOptions.length > 1
-    ? `<select class="cr-cell-select" style="font-size:11px;font-weight:600" onchange="updateTask(${idx},'fps',this.value);setTimeout(()=>openTaskDetailPopup(${idx}),50)">${mediaProfile.fpsOptions.map((value) => `<option value="${String(value).replace(/"/g, '&quot;')}" ${mediaProfile.fps === value ? 'selected' : ''}>${value}</option>`).join('')}</select>`
+    ? `<select class="cr-cell-select" style="font-size:11px;font-weight:600" onchange="updateTask(${idx},'fps',this.value)">${mediaProfile.fpsOptions.map((value) => `<option value="${String(value).replace(/"/g, '&quot;')}" ${mediaProfile.fps === value ? 'selected' : ''}>${value}</option>`).join('')}</select>`
     : `<div data-task-fps="${t.id}" style="font-size:11px;font-weight:600;color:var(--text);padding:3px 0">${mediaProfile.fpsDisplay}</div>`;
 
   const popupHtml = `
@@ -3675,11 +4866,11 @@ function openTaskDetailPopup(idx, event) {
           </div>
           <div style="background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:6px 8px;grid-column:1 / -1">
             <div style="font-size:8px;font-weight:700;color:var(--muted);margin-bottom:2px">MODEL</div>
-            <select class="cr-cell-select" style="font-size:11px;font-weight:600" onchange="updateTask(${idx},'modelId',this.value);setTimeout(()=>openTaskDetailPopup(${idx}),50)">${modelOpts}</select>
+            <select class="cr-cell-select" style="font-size:11px;font-weight:600" onchange="updateTask(${idx},'modelId',this.value)">${modelOpts}</select>
           </div>
           <div style="background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:6px 8px">
             <div style="font-size:8px;font-weight:700;color:var(--muted);margin-bottom:2px">CH&#7870; &#272;&#7896;</div>
-            <select class="cr-cell-select" style="font-size:11px;font-weight:600" onchange="updateTask(${idx},'mode',this.value);setTimeout(()=>openTaskDetailPopup(${idx}),50)">
+            <select class="cr-cell-select" style="font-size:11px;font-weight:600" onchange="updateTask(${idx},'mode',this.value)">
               <option value="i2v" ${t.mode==='i2v'?'selected':''}>&#7842;nh &rarr; Video</option>
               <option value="flf" ${t.mode==='flf'?'selected':''}>Khung &#273;&#7847;u-cu&#7889;i</option>
             </select>
@@ -3712,6 +4903,15 @@ function openTaskDetailPopup(idx, event) {
             <div style="font-size:8px;font-weight:700;color:var(--muted);margin-bottom:2px">CREDITS</div>
             <div data-task-cost="${t.id}" style="font-size:11px;font-weight:600;color:var(--brand);padding:3px 0">${getTaskCostLabel(t)}</div>
           </div>
+          <div style="background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:6px 8px;grid-column:1 / -1">
+            <div style="font-size:8px;font-weight:700;color:var(--muted);margin-bottom:2px">NH\u00d3M HI\u1ec6U \u1ee8NG</div>
+            <select class="cr-cell-select" style="font-size:11px;font-weight:600" onchange="updateTask(${idx},'effectGroup',this.value)">${effectOpts}</select>
+          </div>
+          ${popupCustomEffectInput ? `
+          <div style="background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:6px 8px;grid-column:1 / -1">
+            <div style="font-size:8px;font-weight:700;color:var(--muted);margin-bottom:2px">M\u00d4 T\u1ea2 T\u00d9Y CH\u1eccN</div>
+            ${popupCustomEffectInput}
+          </div>` : ''}
         </div>
 
         <!-- COL 3: Camera + Prompt + QC -->
@@ -3732,18 +4932,22 @@ function openTaskDetailPopup(idx, event) {
               <span style="font-size:8px;color:var(--muted)">T&#7921; &#273;&#7897;ng m&#7903; r&#7897;ng</span>
             </div>
           </div>
-          ${t.qcStatus ? `
-          <div>
-            <div style="display:flex;align-items:center;gap:6px">
+          <div style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;min-height:96px">
+            <div style="font-size:9px;font-weight:700;color:var(--muted);margin-bottom:6px"><i class="fa-solid fa-shield-check" style="color:var(--yellow)"></i> QC</div>
+            <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:6px">
               <span class="cr-qc-badge ${qc.cls}"><i class="fa-solid ${qc.icon}"></i> ${qc.label}</span>
-              ${t.qcNote ? `<span style="font-size:9px;color:var(--muted);font-style:italic">"${t.qcNote}"</span>` : ''}
+              ${qcReviewer ? `<span style="font-size:10px;color:var(--muted)">Reviewer: ${qcReviewer}</span>` : ''}
             </div>
-          </div>` : ''}
+            <div style="font-size:10px;color:var(--text);line-height:1.5">
+              ${qcReason ? `Lý do/Ghi chú: ${qcReason}` : 'Chưa có cập nhật QC'}
+            </div>
+          </div>
+          ${runHistoryHtml}
         </div>
 
         <!-- COL 4: Action Buttons -->
         <div style="flex:0 0 auto;display:flex;flex-direction:column;gap:6px;min-width:100px">
-          ${t.status === 'idle' ? `<button class="cr-btn cr-btn-run" style="font-size:11px;white-space:nowrap" onclick="closeTaskDetailPopup();runSingleTask(${idx})"><i class="fa-solid fa-play"></i> Ch&#7841;y</button>` : ''}
+          ${canStartTask ? `<button class="cr-btn cr-btn-run" style="font-size:11px;white-space:nowrap" onclick="closeTaskDetailPopup();runSingleTask(${idx})"><i class="fa-solid ${isRerun ? 'fa-rotate-right' : 'fa-play'}"></i> ${isRerun ? 'Re-run' : 'Ch&#7841;y'}</button>` : ''}
           ${t.status === 'running' ? `<button class="cr-btn cr-btn-ghost" style="font-size:11px;white-space:nowrap" onclick="closeTaskDetailPopup();pollTaskStatus(${idx})"><i class="fa-solid fa-rotate-right"></i> C&#7853;p nh&#7853;t</button>` : ''}
           ${t.status === 'done' ? `<button class="cr-btn cr-btn-primary" style="font-size:11px;white-space:nowrap" onclick="closeTaskDetailPopup();previewTaskVideo(${idx})"><i class="fa-solid fa-eye"></i> Xem</button>` : ''}
           ${canSendTaskQC(t) ? `<button class="cr-btn cr-btn-ghost" style="font-size:11px;white-space:nowrap" onclick="closeTaskDetailPopup();sendTaskQC(${idx})"><i class="fab fa-telegram"></i> QC</button>` : ''}
@@ -3753,10 +4957,15 @@ function openTaskDetailPopup(idx, event) {
     </div>
   `;
 
-  const container = document.createElement('div');
-  container.id = 'taskDetailPopupContainer';
+  let container = document.getElementById('taskDetailPopupContainer');
+  const existed = !!container;
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'taskDetailPopupContainer';
+  }
+  if (container._escHandler) document.removeEventListener('keydown', container._escHandler);
   container.innerHTML = popupHtml;
-  document.body.appendChild(container);
+  if (!existed) document.body.appendChild(container);
 
   const escHandler = (e) => { if (e.key === 'Escape') closeTaskDetailPopup(); };
   container._escHandler = escHandler;
@@ -3778,6 +4987,12 @@ function closeTaskDetailPopup() {
     if (container._escHandler) document.removeEventListener('keydown', container._escHandler);
     container.remove();
   }
+}
+
+function refreshTaskDetailPopup(idx) {
+  const container = document.getElementById('taskDetailPopupContainer');
+  if (!container) return;
+  openTaskDetailPopup(idx, null, true);
 }
 
 // ========== VIDEO PREVIEW ==========
@@ -3832,7 +5047,7 @@ window.syncCreatorQCFromLibrary = syncCreatorQCFromLibrary;
 function __buildFallbackTaskRowHtml(taskIndex, message) {
   const safeIndex = Number.isFinite(taskIndex) ? taskIndex : 0;
   const safeMessage = String(message || 'render_error').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  return `<tr class="cr-task-row cr-task-row-fallback"><td>${safeIndex + 1}</td><td colspan="14" style="color:var(--red);font-size:12px">L&#7895;i render task #${safeIndex + 1}: ${safeMessage}</td></tr>`;
+  return `<div class="cr-task-row-shell" data-task-idx="${safeIndex}"><div class="cr-task-row-fallback">L&#7895;i render task #${safeIndex + 1}: ${safeMessage}</div></div>`;
 }
 
 function addTaskRow() {
@@ -3848,16 +5063,17 @@ function addTaskRow() {
     const newTask = createDefaultTask();
     combo.tasks.push(newTask);
     const newIdx = combo.tasks.length - 1;
+    scheduleSaveCreatorDraftState(0);
 
     let rowRendered = false;
     const body = document.getElementById('taskTableBody');
     if (body) {
       try {
-        const emptyStateRow = body.querySelector('td[colspan="14"]');
+        const emptyStateRow = body.querySelector('.cr-task-empty-state');
         if (emptyStateRow) body.innerHTML = '';
         const rowHtml = renderTaskRow(newTask, newIdx);
         body.insertAdjacentHTML('beforeend', rowHtml);
-        rowRendered = body.querySelectorAll('tr.cr-task-row').length > 0;
+        rowRendered = true;
       } catch (renderErr) {
         body.insertAdjacentHTML('beforeend', __buildFallbackTaskRowHtml(newIdx, renderErr && renderErr.message ? renderErr.message : 'render_error'));
         rowRendered = true;
@@ -3867,8 +5083,7 @@ function addTaskRow() {
     if (!rowRendered) {
       try { renderActiveCombo(); } catch (_) {}
     }
-    try { renderComboTabs(); } catch (_) {}
-    try { recalcAllCosts(); } catch (_) {}
+    try { syncActiveComboTabMeta(); } catch (_) {}
   } catch (err) {
     const msg = err && err.message ? String(err.message) : 'Kh\u00F4ng x\u00E1c \u0111\u1ECBnh';
     showToast(`L\u1ED7i addTaskRow: ${msg}`, 'error');
@@ -3882,4 +5097,7 @@ function __addTaskRowSafe() {
 
 window.addTaskRow = addTaskRow;
 window.__addTaskRowSafe = __addTaskRowSafe;
+window.openTaskDetailPopup = openTaskDetailPopup;
+window.closeTaskDetailPopup = closeTaskDetailPopup;
+window.renderLibraryIfChanged = renderLibraryIfChanged;
 
