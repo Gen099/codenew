@@ -171,6 +171,7 @@ function ensureCreatorRealtimePolling() {
 
 function autoPollRunningTasks() {
   if (!Array.isArray(taskCombos) || taskCombos.length === 0) return;
+  const targets = [];
   taskCombos.forEach((combo) => {
     const tasks = Array.isArray(combo?.tasks) ? combo.tasks : [];
     tasks.forEach((task) => {
@@ -178,9 +179,65 @@ function autoPollRunningTasks() {
       if (String(task.status || '').toLowerCase() !== 'running') return;
       if (!String(task.taskId || '').trim()) return;
       if (task.__polling) return;
-      pollTaskStatusByRef(task, combo, { silent: true });
+      targets.push({ task, combo });
     });
   });
+  if (!targets.length) return;
+  if (API && typeof API.pollVideoBatch === 'function') {
+    const taskIds = targets.map((row) => String(row.task.taskId || '').trim()).filter(Boolean);
+    API.pollVideoBatch(taskIds).then((res) => {
+      const items = Array.isArray(res?.items) ? res.items : [];
+      const byId = new Map(items.map((row) => [String(row.task_id || '').trim(), row]));
+      targets.forEach(({ task, combo }) => {
+        const row = byId.get(String(task.taskId || '').trim());
+        if (!row) {
+          pollTaskStatusByRef(task, combo, { silent: true });
+          return;
+        }
+        _applyPolledTaskState(task, combo, row, true);
+      });
+    }).catch(() => {
+      targets.forEach(({ task, combo }) => pollTaskStatusByRef(task, combo, { silent: true }));
+    });
+    return;
+  }
+  targets.forEach(({ task, combo }) => pollTaskStatusByRef(task, combo, { silent: true }));
+}
+
+function _applyPolledTaskState(task, combo, r, silent = false) {
+  const beforeSignature = _getTaskRuntimeSignature(task);
+  const state = String(r && r.state ? r.state : 'pending');
+  const progress = Number(r && r.progress ? r.progress : 0) || 0;
+  if (state === 'success') {
+    _applyTaskLifecycleState(task, 'done', { progress: 100 });
+    task.resultUrl = r.result_url || '';
+    task.coverUrl = r.cover_url || task.coverUrl || '';
+    scheduleSaveCreatorDraftState(0);
+    _upsertLibraryFromTask(task, combo, 'done', {
+      resultUrl: task.resultUrl || '',
+      executionTime: task.executionTime || '-',
+      pct: 100,
+    });
+    syncTaskQCStatusByRef(task, combo, { silent: true }).catch(() => {});
+    if (!silent) showToast(`Task hoàn tất: ${task.resultName}`, 'success');
+  } else if (state === 'fail') {
+    _applyTaskLifecycleState(task, 'fail', { failMsg: (r && r.fail_msg) || 'Task failed' });
+    scheduleSaveCreatorDraftState(0);
+    _upsertLibraryFromTask(task, combo, 'rejected', {
+      qcNote: task.failMsg,
+    });
+    if (!silent) showToast(task.failMsg === 'Hết tiền' ? 'Hết tiền' : `Task thất bại: ${task.failMsg}`, 'error');
+  } else {
+    _applyTaskLifecycleState(task, 'running', { progress });
+    scheduleSaveCreatorDraftState(0);
+    _upsertLibraryFromTask(task, combo, 'processing', { pct: Number(task.progress || 0) });
+    if (!silent) showToast(`Task đang xử lý: ${Math.round(task.progress)}%`, 'info');
+  }
+  const afterSignature = _getTaskRuntimeSignature(task);
+  if (afterSignature !== beforeSignature) {
+    _rerenderTaskByRef(task, combo);
+    renderLibraryIfChanged();
+  }
 }
 
 function _applyTaskLifecycleState(task, nextState, extra = {}) {
@@ -3829,32 +3886,7 @@ async function pollTaskStatusByRef(task, comboRef = null, options = {}) {
   task.__polling = true;
   try {
     const r = await API.pollVideo(task.taskId);
-    const state = String(r && r.state ? r.state : 'pending');
-    const progress = Number(r && r.progress ? r.progress : 0) || 0;
-    if (state === 'success') {
-      _applyTaskLifecycleState(task, 'done', { progress: 100 });
-      task.resultUrl = r.result_url || '';
-      scheduleSaveCreatorDraftState(0);
-      _upsertLibraryFromTask(task, combo, 'done', {
-        resultUrl: task.resultUrl || '',
-        executionTime: task.executionTime || '-',
-        pct: 100,
-      });
-      syncTaskQCStatusByRef(task, combo, { silent: true }).catch(() => {});
-      if (!silent) showToast(`Task ho\u00E0n t\u1EA5t: ${task.resultName}`, 'success');
-    } else if (state === 'fail') {
-      _applyTaskLifecycleState(task, 'fail', { failMsg: (r && r.fail_msg) || 'Task failed' });
-      scheduleSaveCreatorDraftState(0);
-      _upsertLibraryFromTask(task, combo, 'rejected', {
-        qcNote: task.failMsg,
-      });
-      if (!silent) showToast(task.failMsg === 'Hết tiền' ? 'Hết tiền' : `Task th\u1EA5t b\u1EA1i: ${task.failMsg}`, 'error');
-    } else {
-      _applyTaskLifecycleState(task, 'running', { progress });
-      scheduleSaveCreatorDraftState(0);
-      _upsertLibraryFromTask(task, combo, 'processing', { pct: Number(task.progress || 0) });
-      if (!silent) showToast(`Task \u0111ang x\u1EED l\u00FD: ${Math.round(task.progress)}%`, 'info');
-    }
+    _applyPolledTaskState(task, combo, r, silent);
   } catch (err) {
     if (!silent) showToast(`Poll th\u1EA5t b\u1EA1i: ${err && err.message ? err.message : 'L\u1ED7i kh\u00F4ng x\u00E1c \u0111\u1ECBnh'}`, 'error');
   } finally {
