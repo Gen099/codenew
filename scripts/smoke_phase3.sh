@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'rc=$?; echo "[SMOKE][TRACE] ${BASH_SOURCE[0]}:${LINENO} :: ${BASH_COMMAND} (exit=${rc})"; exit "${rc}"' ERR
 
 APP_DIR="${1:-/opt/faistudio}"
 
@@ -40,11 +41,13 @@ CREATOR="$APP_DIR/frontend/js/creator.js"
 SCREENS="$APP_DIR/frontend/js/screens.js"
 APPJS="$APP_DIR/frontend/js/app.js"
 DATAJS="$APP_DIR/frontend/js/data.js"
+MONITORJS="$APP_DIR/frontend/js/monitor.js"
 
 require_file "$CREATOR"
 require_file "$SCREENS"
 require_file "$APPJS"
 require_file "$DATAJS"
+require_file "$MONITORJS"
 
 # 1) Add-row must not recurse, must have one primary handler binding
 assert_contains "$CREATOR" "window.addTaskRow = addTaskRow;"
@@ -58,7 +61,7 @@ assert_contains "$DATAJS" "function getViewProfile() {"
 assert_contains "$DATAJS" "function isSameStaffRef(a, b) {"
 assert_contains "$SCREENS" "const scopeUser = String(getScopeUsername() || '').trim();"
 assert_contains "$SCREENS" "isSameStaffRef(item.staffId, dashboardFilters.user)"
-assert_contains "$SCREENS" "isSameStaffRef(row.staffId || row.username || '', qcStaffFilter)"
+assert_contains "$SCREENS" "isSameStaffRef(row.staffId || row.username || '', qcFilters.staffId)"
 assert_contains "$APPJS" "const scopedUsername = String(getScopeUsername() || '').trim();"
 assert_contains "$APPJS" "const currentUsername = String(getScopeUsername() || '').toLowerCase();"
 assert_contains "$APPJS" "const viewProfile = (typeof getViewProfile === 'function') ? getViewProfile() : (AppData.currentUser || {});"
@@ -69,4 +72,3 @@ assert_not_contains "$APPJS" "scopedUsername = String(AppData.currentUser?.usern
 assert_not_contains "$APPJS" "currentUsername = String(AppData.currentUser?.username || '').toLowerCase();"
 
 echo "[SMOKE][OK] Phase3 smoke passed"
-
