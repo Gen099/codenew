@@ -19,14 +19,23 @@ copy_file() {
   install -m 644 "$src" "$dst"
 }
 
+copy_file_if_exists() {
+  local src="$1"
+  local dst="$2"
+  if [[ ! -f "$src" ]]; then
+    return 0
+  fi
+  install -m 644 "$src" "$dst"
+}
+
 copy_file "$APP_DIR/index.html" "$APP_DIR/frontend/index.html"
-copy_file "$APP_DIR/docs.html" "$APP_DIR/frontend/docs.html"
-copy_file "$APP_DIR/css/docs.css" "$APP_DIR/frontend/css/docs.css"
+copy_file_if_exists "$APP_DIR/docs.html" "$APP_DIR/frontend/docs.html"
+copy_file_if_exists "$APP_DIR/css/docs.css" "$APP_DIR/frontend/css/docs.css"
 copy_file "$APP_DIR/js/api.js" "$APP_DIR/frontend/js/api.js"
 copy_file "$APP_DIR/js/app.js" "$APP_DIR/frontend/js/app.js"
 copy_file "$APP_DIR/js/data.js" "$APP_DIR/frontend/js/data.js"
-copy_file "$APP_DIR/js/docs.js" "$APP_DIR/frontend/js/docs.js"
-copy_file "$APP_DIR/js/monitor.js" "$APP_DIR/frontend/js/monitor.js"
+copy_file_if_exists "$APP_DIR/js/docs.js" "$APP_DIR/frontend/js/docs.js"
+copy_file_if_exists "$APP_DIR/js/monitor.js" "$APP_DIR/frontend/js/monitor.js"
 copy_file "$APP_DIR/js/screens.js" "$APP_DIR/frontend/js/screens.js"
 copy_file "$APP_DIR/js/creator.js" "$APP_DIR/frontend/js/creator.js"
 
