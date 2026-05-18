@@ -7,15 +7,219 @@ let currentHRTab = 'staff';
 let _pendingPollTimer = null;
 let _registerPendingPollTimer = null;
 let _recoverPendingPollTimer = null;
+let _registerRetryTimer = null;
 let _bgPollTimer = null;
+let _smoothProgressTimer = null;
 let _activeShiftTimer = null;
 let _lastRecoverStuckAt = 0;
+let _lastAuthGuardAt = 0;
 let _lastSystemStatusSignature = '';
 let _lastSessionCollectionSignature = '';
+let _postLoginRefreshTimer = null;
+const _processingDoneToastIds = new Set();
+const APP_VERSION = String(window.__APP_VERSION__ || '').trim() || 'dev';
+const FRONTEND_UPDATE_SEEN_KEY = 'frontendUpdateSeenVersion';
+const POST_LOGIN_REFRESH_SEEN_KEY = 'postLoginRefreshSeenSignature';
 const REGISTER_PENDING_STORAGE_KEY = 'registerPendingRequestId';
 const REGISTER_PENDING_CREDENTIALS_KEY = 'registerPendingCredentials';
 const RECOVER_PENDING_STORAGE_KEY = 'recoverPendingRequestId';
 const RECOVER_PENDING_CREDENTIALS_KEY = 'recoverPendingCredentials';
+
+function markFrontendUpdateSeen(version) {
+  const value = String(version || '').trim();
+  if (!value) return;
+  try { localStorage.setItem(FRONTEND_UPDATE_SEEN_KEY, value); } catch (_) {}
+}
+
+function getFrontendUpdateSeen() {
+  try { return String(localStorage.getItem(FRONTEND_UPDATE_SEEN_KEY) || '').trim(); } catch (_) { return ''; }
+}
+
+function showFrontendUpdatePopup(serverVersion) {
+  const targetVersion = String(serverVersion || '').trim();
+  if (!targetVersion || targetVersion === APP_VERSION) return;
+  if (getFrontendUpdateSeen() === targetVersion) return;
+  if (document.getElementById('frontendUpdateOverlay')) return;
+  const overlay = document.createElement('div');
+  overlay.id = 'frontendUpdateOverlay';
+  overlay.innerHTML = `
+    <style>
+      .frontend-update-overlay{position:fixed;inset:0;background:rgba(0,0,0,.48);display:flex;align-items:center;justify-content:center;z-index:10070;padding:20px}
+      .frontend-update-card{width:min(520px,calc(100vw - 32px));background:var(--card);border:1px solid rgba(217,122,43,.45);border-radius:18px;box-shadow:0 18px 64px rgba(0,0,0,.5);overflow:hidden}
+      .frontend-update-head{padding:18px 20px;border-bottom:1px solid var(--border);background:rgba(217,122,43,.08)}
+      .frontend-update-title{font-size:18px;font-weight:800;color:var(--text)}
+      .frontend-update-body{padding:18px 20px;font-size:14px;line-height:1.7;color:var(--text)}
+      .frontend-update-meta{padding:0 20px 14px;color:var(--muted);font-size:12px}
+      .frontend-update-actions{display:flex;justify-content:flex-end;gap:10px;padding:0 20px 20px}
+      .frontend-update-btn{height:40px;padding:0 16px;border-radius:10px;border:1px solid var(--border);background:var(--bg2);color:var(--text);font-size:13px;font-weight:700;cursor:pointer}
+      .frontend-update-btn.primary{border-color:rgba(217,122,43,.45);background:rgba(217,122,43,.14);color:var(--brand)}
+    </style>
+    <div class="frontend-update-overlay">
+      <div class="frontend-update-card" role="alertdialog" aria-modal="true" aria-live="assertive">
+        <div class="frontend-update-head">
+          <div class="frontend-update-title">Có bản cập nhật mới</div>
+        </div>
+        <div class="frontend-update-body">Hệ thống đã deploy giao diện mới. Trình duyệt này đang chạy bản cũ và cần tải lại để nhận đúng thay đổi.</div>
+        <div class="frontend-update-meta">Client: <b>${escapeHtml(APP_VERSION)}</b> | Server: <b>${escapeHtml(targetVersion)}</b></div>
+        <div class="frontend-update-actions">
+          <button type="button" class="frontend-update-btn" id="frontendUpdateOkBtn">OK</button>
+        </div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  const close = () => {
+    markFrontendUpdateSeen(targetVersion);
+    const node = document.getElementById('frontendUpdateOverlay');
+    if (node) node.remove();
+  };
+  const okBtn = document.getElementById('frontendUpdateOkBtn');
+  if (okBtn) okBtn.addEventListener('click', close);
+}
+
+function getPostLoginRefreshNoticeConfig() {
+  const systemValue = AppData.systemStatus?.post_login_refresh_notice;
+  const directValue = AppData.postLoginRefreshNotice;
+  const row = (systemValue && typeof systemValue === 'object')
+    ? systemValue
+    : ((directValue && typeof directValue === 'object') ? directValue : {});
+  return {
+    enabled: !!row.enabled,
+    title: String(row.title || 'Hệ thống vừa cập nhật sửa lỗi').trim() || 'Hệ thống vừa cập nhật sửa lỗi',
+    message: String(row.message || 'Bắt buộc làm mới trình duyệt để nhận bản sửa mới nhất. Hệ thống sẽ tự làm mới sau 10 giây.').trim() || 'Bắt buộc làm mới trình duyệt để nhận bản sửa mới nhất. Hệ thống sẽ tự làm mới sau 10 giây.',
+    countdownSeconds: Math.max(3, Math.min(10, Number(row.countdown_seconds || 10) || 10)),
+    roles: Array.isArray(row.roles) ? row.roles.map((item) => String(item || '').trim().toLowerCase()).filter((item) => ['admin', 'qc_manager', 'staff'].includes(item)) : ['admin', 'qc_manager', 'staff'],
+  };
+}
+
+function canCurrentUserSeePostLoginRefreshNotice(notice) {
+  const role = String(AppData.currentUser?.role || AppData.authUser?.role || '').trim().toLowerCase();
+  const roles = Array.isArray(notice?.roles) ? notice.roles : [];
+  if (!role) return false;
+  if (!roles.length) return true;
+  return roles.includes(role);
+}
+
+function getPostLoginRefreshSignature() {
+  const notice = getPostLoginRefreshNoticeConfig();
+  return JSON.stringify({
+    frontendVersion: String(AppData.systemStatus?.frontend_version || APP_VERSION || 'dev'),
+    enabled: !!notice.enabled,
+    title: notice.title,
+    message: notice.message,
+    countdownSeconds: notice.countdownSeconds,
+  });
+}
+
+function getPostLoginRefreshSeenSignature() {
+  try { return String(sessionStorage.getItem(POST_LOGIN_REFRESH_SEEN_KEY) || '').trim(); } catch (_) { return ''; }
+}
+
+function markPostLoginRefreshSeen(signature) {
+  const value = String(signature || '').trim();
+  if (!value) return;
+  try { sessionStorage.setItem(POST_LOGIN_REFRESH_SEEN_KEY, value); } catch (_) {}
+}
+
+function performForcedFrontendRefresh() {
+  markPostLoginRefreshSeen(getPostLoginRefreshSignature());
+  const nextUrl = new URL(window.location.href);
+  nextUrl.searchParams.set('__fr', String(Date.now()));
+  nextUrl.searchParams.set('__fv', String(AppData.systemStatus?.frontend_version || APP_VERSION || 'dev'));
+  window.location.replace(nextUrl.toString());
+}
+
+function showPostLoginRefreshPopup() {
+  const notice = getPostLoginRefreshNoticeConfig();
+  if (!notice.enabled) return;
+  if (!canCurrentUserSeePostLoginRefreshNotice(notice)) return;
+  const signature = getPostLoginRefreshSignature();
+  if (getPostLoginRefreshSeenSignature() === signature) return;
+  markPostLoginRefreshSeen(signature);
+  if (_postLoginRefreshTimer) {
+    clearInterval(_postLoginRefreshTimer);
+    _postLoginRefreshTimer = null;
+  }
+  const existing = document.getElementById('postLoginRefreshOverlay');
+  if (existing) existing.remove();
+  const overlay = document.createElement('div');
+  overlay.id = 'postLoginRefreshOverlay';
+  overlay.innerHTML = `
+    <style>
+      .post-login-refresh-overlay{position:fixed;inset:0;background:rgba(0,0,0,.58);display:flex;align-items:center;justify-content:center;z-index:10080;padding:20px}
+      .post-login-refresh-card{width:min(560px,calc(100vw - 32px));background:var(--card);border:1px solid rgba(217,122,43,.45);border-radius:18px;box-shadow:0 18px 64px rgba(0,0,0,.5);overflow:hidden}
+      .post-login-refresh-head{padding:18px 20px;border-bottom:1px solid var(--border);background:rgba(217,122,43,.08)}
+      .post-login-refresh-title{font-size:18px;font-weight:800;color:var(--text)}
+      .post-login-refresh-body{padding:18px 20px 8px;font-size:14px;line-height:1.7;color:var(--text)}
+      .post-login-refresh-meta{padding:0 20px 14px;color:var(--muted);font-size:12px}
+    </style>
+    <div class="post-login-refresh-overlay">
+      <div class="post-login-refresh-card" role="alertdialog" aria-modal="true" aria-live="assertive">
+        <div class="post-login-refresh-head">
+          <div class="post-login-refresh-title">${escapeHtml(notice.title)}</div>
+        </div>
+        <div class="post-login-refresh-body">${escapeHtml(notice.message)}</div>
+        <div class="post-login-refresh-meta" id="postLoginRefreshCountdown">Tự động làm mới sau ${notice.countdownSeconds}s</div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  const countdownEl = document.getElementById('postLoginRefreshCountdown');
+  let remaining = notice.countdownSeconds;
+  _postLoginRefreshTimer = setInterval(() => {
+    remaining -= 1;
+    if (countdownEl) countdownEl.textContent = remaining > 0 ? `Tự động làm mới sau ${remaining}s` : 'Đang làm mới...';
+    if (remaining <= 0) {
+      clearInterval(_postLoginRefreshTimer);
+      _postLoginRefreshTimer = null;
+      markPostLoginRefreshSeen(signature);
+      performForcedFrontendRefresh();
+    }
+  }, 1000);
+}
+
+function handleFrontendVersionMismatch(systemStatus) {
+  const serverVersion = String(systemStatus?.frontend_version || '').trim();
+  if (!serverVersion || serverVersion === APP_VERSION) return;
+  showFrontendUpdatePopup(serverVersion);
+}
+
+function _clearRegisterRetryCountdown() {
+  if (_registerRetryTimer) {
+    clearInterval(_registerRetryTimer);
+    _registerRetryTimer = null;
+  }
+}
+
+function _setRegisterButtonState(disabled, secondsLeft = 0) {
+  const btn = document.getElementById('registerBtn');
+  if (!btn) return;
+  btn.disabled = !!disabled;
+  if (disabled && Number(secondsLeft || 0) > 0) {
+    btn.innerHTML = `<i class="fa-solid fa-clock"></i> Thử lại sau ${Math.max(0, Math.ceil(Number(secondsLeft) || 0))}s`;
+    return;
+  }
+  btn.innerHTML = '<i class="fa-solid fa-paper-plane"></i> Gửi yêu cầu đăng ký';
+}
+
+function _startRegisterRetryCountdown(seconds) {
+  let remaining = Math.max(0, Math.ceil(Number(seconds || 0)));
+  _clearRegisterRetryCountdown();
+  _setRegisterButtonState(true, remaining);
+  if (remaining <= 0) {
+    _setRegisterButtonState(false, 0);
+    return;
+  }
+  _registerRetryTimer = setInterval(() => {
+    remaining -= 1;
+    if (remaining <= 0) {
+      _clearRegisterRetryCountdown();
+      _setRegisterButtonState(false, 0);
+      return;
+    }
+    _setRegisterButtonState(true, remaining);
+  }, 1000);
+}
 
 // Role configs mapped from AppData.staff
 function getRoleConfig(role) {
@@ -62,6 +266,8 @@ function getSystemStatusSignature(status) {
     pending_video: Number(data.pending_video || 0),
     pending_image: Number(data.pending_image || 0),
     announcements: Array.isArray(data.announcements) ? data.announcements.map((row) => String(row || '')) : [],
+    shift_popup_templates: data.shift_popup_templates && typeof data.shift_popup_templates === 'object' ? data.shift_popup_templates : {},
+    post_login_refresh_notice: data.post_login_refresh_notice && typeof data.post_login_refresh_notice === 'object' ? data.post_login_refresh_notice : {},
     online_staff: onlineUsers.map((row) => ({
       username: String(row?.username || '').trim(),
       display_name: String(row?.display_name || '').trim(),
@@ -88,6 +294,8 @@ function getSessionCollectionSignature(rows) {
     last_seen: Number(row?.last_seen || 0),
     online_since: Number(row?.online_since || 0),
     online_seconds: Number(row?.online_seconds || 0),
+    device_name: String(row?.client_meta?.device_name || '').trim(),
+    ip: String(row?.client_meta?.ip || '').trim(),
   })));
 }
 
@@ -110,6 +318,7 @@ function normalizeOnlineSessions(onlineUsers = []) {
     online_seconds: Number(row.online_seconds || 0),
     last_seen: Number(row.last_seen || 0),
     online_since: Number(row.online_since || 0),
+    client_meta: (row.client_meta && typeof row.client_meta === 'object') ? { ...row.client_meta } : {},
     status: 'active',
   }));
 }
@@ -125,7 +334,11 @@ function applySystemStatusSnapshot(status) {
       pending_video: Number(nextStatus.pending_video || 0),
       pending_image: Number(nextStatus.pending_image || 0),
       announcements: Array.isArray(nextStatus.announcements) ? nextStatus.announcements.slice() : [],
+      shift_popup_templates: (nextStatus.shift_popup_templates && typeof nextStatus.shift_popup_templates === 'object') ? { ...nextStatus.shift_popup_templates } : {},
+      post_login_refresh_notice: (nextStatus.post_login_refresh_notice && typeof nextStatus.post_login_refresh_notice === 'object') ? { ...nextStatus.post_login_refresh_notice } : {},
     };
+    AppData.shiftPopupTemplates = (nextStatus.shift_popup_templates && typeof nextStatus.shift_popup_templates === 'object') ? { ...nextStatus.shift_popup_templates } : {};
+    AppData.postLoginRefreshNotice = (nextStatus.post_login_refresh_notice && typeof nextStatus.post_login_refresh_notice === 'object') ? { ...nextStatus.post_login_refresh_notice } : {};
     _lastSystemStatusSignature = nextSignature;
   }
   const normalizedSessions = normalizeOnlineSessions(nextStatus.online_staff || []);
@@ -159,6 +372,22 @@ function syncCurrentUserUI() {
 }
 
 function resetCreatorRuntimeState() {
+  if (typeof creatorPresenceTimer !== 'undefined' && creatorPresenceTimer) {
+    clearTimeout(creatorPresenceTimer);
+    creatorPresenceTimer = 0;
+  }
+  if (typeof creatorRealtimePollTimer !== 'undefined' && creatorRealtimePollTimer) {
+    clearInterval(creatorRealtimePollTimer);
+    creatorRealtimePollTimer = 0;
+  }
+  if (typeof creatorDraftSaveTimer !== 'undefined' && creatorDraftSaveTimer) {
+    clearTimeout(creatorDraftSaveTimer);
+    creatorDraftSaveTimer = 0;
+  }
+  if (typeof recalcAllCostsTimer !== 'undefined' && recalcAllCostsTimer) {
+    clearTimeout(recalcAllCostsTimer);
+    recalcAllCostsTimer = 0;
+  }
   if (typeof taskCombos !== 'undefined') taskCombos = [];
   if (typeof activeComboIdx !== 'undefined') activeComboIdx = 0;
   if (typeof comboCounter !== 'undefined') comboCounter = 0;
@@ -166,6 +395,8 @@ function resetCreatorRuntimeState() {
   if (typeof batchEditVisible !== 'undefined') batchEditVisible = false;
   if (typeof selectedImageIds !== 'undefined') selectedImageIds = [];
   if (typeof bulkSelectMode !== 'undefined') bulkSelectMode = false;
+  if (typeof creatorBatchPollInFlight !== 'undefined') creatorBatchPollInFlight = false;
+  if (typeof creatorLastLibraryRenderSignature !== 'undefined') creatorLastLibraryRenderSignature = '';
   if (Array.isArray(AppData.images)) AppData.images.splice(0, AppData.images.length);
   if (Array.isArray(AppData.library)) AppData.library.splice(0, AppData.library.length);
 }
@@ -186,6 +417,7 @@ function switchAuthTab(tab) {
   const tabRegister = document.getElementById('authTabRegister');
   if (_registerPendingPollTimer) { clearInterval(_registerPendingPollTimer); _registerPendingPollTimer = null; }
   if (_recoverPendingPollTimer) { clearInterval(_recoverPendingPollTimer); _recoverPendingPollTimer = null; }
+  _clearRegisterRetryCountdown();
   if (loginPending) loginPending.style.display = 'none';
   if (recoverPending) recoverPending.style.display = 'none';
   if (registerPending) registerPending.style.display = 'none';
@@ -197,6 +429,7 @@ function switchAuthTab(tab) {
   if (registerForm) registerForm.style.display = mode === 'register' ? '' : 'none';
   if (tabLogin) tabLogin.style.opacity = mode === 'login' ? '1' : '.7';
   if (tabRegister) tabRegister.style.opacity = mode === 'register' ? '1' : '.7';
+  _setRegisterButtonState(false, 0);
 }
 
 function showLoginScreen() {
@@ -506,6 +739,7 @@ async function pollRegisterRequestStatus(requestId, options = {}) {
       if (reason) msg += ` Lý do: ${reason}`;
       if (reviewer) msg += ` Reviewer: ${reviewer}`;
       showRegisterError(msg);
+      _startRegisterRetryCountdown(5);
       return;
     }
     _showRegisterPendingMessage(`Chờ Admin phê duyệt qua Telegram. Mã yêu cầu: ${reqId}`);
@@ -586,11 +820,21 @@ function resetClientAuthState() {
   try {
     if (_pendingPollTimer) { clearInterval(_pendingPollTimer); _pendingPollTimer = null; }
   } catch (_) {}
+  try {
+    if (_bgPollTimer) { clearInterval(_bgPollTimer); _bgPollTimer = null; }
+  } catch (_) {}
+  try {
+    if (_smoothProgressTimer) { clearInterval(_smoothProgressTimer); _smoothProgressTimer = null; }
+  } catch (_) {}
+  try {
+    if (_activeShiftTimer) { clearTimeout(_activeShiftTimer); _activeShiftTimer = null; }
+  } catch (_) {}
   _clearRegisterPendingState();
   _clearRecoverPendingState();
   _clearRegisterPendingCredentials();
   _clearRecoverPendingCredentials();
   try { API.clearToken(); } catch (_) {}
+  resetCreatorRuntimeState();
   AppData.authUser = null;
   AppData.viewingAsUserId = '';
   AppData.authSession = { userId: '', username: '', role: '', permissions: [] };
@@ -655,12 +899,11 @@ async function handleRegisterRequest(e) {
     _setRegisterPendingCredentials({ username, password });
     startRegisterPendingPoll(String(data?.request_id || '').trim());
   } catch (err) {
+    const retryAfter = Number(err?.payload?.detail?.retry_after_seconds || err?.payload?.retry_after_seconds || 0);
     showRegisterError(err && err.message ? err.message : 'Gửi yêu cầu đăng ký thất bại');
+    if (retryAfter > 0) _startRegisterRetryCountdown(retryAfter);
   } finally {
-    if (btn) {
-      btn.disabled = false;
-      btn.innerHTML = '<i class="fa-solid fa-paper-plane"></i> Gửi yêu cầu đăng ký';
-    }
+    if (!_registerRetryTimer) _setRegisterButtonState(false, 0);
   }
 }
 
@@ -749,22 +992,56 @@ async function onLoginSuccess(user) {
     mode: 'self',
   };
   currentRole = user.role;
+  if (window.AppMonitor && typeof window.AppMonitor.setContext === 'function') {
+    window.AppMonitor.setContext({
+      currentUser: String(user.username || ''),
+      currentRole: String(user.role || ''),
+      currentScreen: String(currentScreen || 'dashboard'),
+    });
+    if (typeof window.AppMonitor.addEvent === 'function') window.AppMonitor.addEvent('login', `${String(user.username || '')}:${String(user.role || '')}`, 'info');
+  }
   syncCurrentUserUI();
-  // Load data and init screens
+  // Load data and init screens. A screen init failure must not block login.
   await loadDataFromAPI();
   initAllScreens();
-  if (typeof refreshSidebarCredits === 'function') {
-    await refreshSidebarCredits();
+  try {
+    if (typeof refreshSidebarCredits === 'function') {
+      await refreshSidebarCredits();
+    }
+  } catch (err) {
+    console.warn('[login] refreshSidebarCredits failed:', err && err.message ? err.message : err);
   }
-  await loadChatHistory();
-  await loadNotifications();
-  await refreshOnlinePresence();
-  applyRoleAccessUI();
-  initCharts();
-  startBackgroundPolling();
+  try {
+    await loadNotifications();
+  } catch (err) {
+    console.warn('[login] loadNotifications failed:', err && err.message ? err.message : err);
+  }
+  try {
+    await refreshOnlinePresence();
+  } catch (err) {
+    console.warn('[login] refreshOnlinePresence failed:', err && err.message ? err.message : err);
+  }
+  try {
+    applyRoleAccessUI();
+  } catch (err) {
+    console.warn('[login] applyRoleAccessUI failed:', err && err.message ? err.message : err);
+  }
+  try {
+    initCharts();
+  } catch (err) {
+    console.warn('[login] initCharts failed:', err && err.message ? err.message : err);
+  }
+  try {
+    startBackgroundPolling();
+  } catch (err) {
+    console.warn('[login] startBackgroundPolling failed:', err && err.message ? err.message : err);
+  }
   document.body.classList.remove('app-booting');
   hideLoginScreen();
+  showPostLoginRefreshPopup();
 }
+
+let _lastSyncHealthToastSignature = '';
 
 async function loadDataFromAPI() {
   // Use raw fetch (not API.fetch) to avoid auto-logout on 401/404
@@ -775,27 +1052,98 @@ async function loadDataFromAPI() {
   async function safeFetch(path) {
     try {
       const res = await fetch(API.BASE + path, { headers });
-      if (!res.ok) return null;
-      return await res.json();
-    } catch { return null; }
+      const contentType = String(res.headers.get('content-type') || '').toLowerCase();
+      let payload = null;
+      try {
+        payload = contentType.includes('application/json') ? await res.json() : await res.text();
+      } catch (_) {
+        payload = null;
+      }
+      if (!res.ok) {
+        const detail = payload && typeof payload === 'object'
+          ? String(payload.detail || payload.message || payload.error || '').trim()
+          : String(payload || '').trim();
+        return { ok: false, path, status: res.status, data: null, error: detail || `HTTP ${res.status}` };
+      }
+      return { ok: true, path, status: res.status, data: payload, error: '' };
+    } catch (err) {
+      return { ok: false, path, status: 0, data: null, error: String(err?.message || 'Network error').trim() || 'Network error' };
+    }
   }
 
   try {
     const scopedUsername = String(getScopeUsername() || '').trim();
-    const [users, library, history, systemStatus, shiftConfig, activeWorkTask, currentShiftSummary, workTasks, providerSettings, providerCatalog, shiftReports, qcQueue] = await Promise.all([
+    const role = String(AppData.authUser?.role || AppData.currentUser?.role || '').trim().toLowerCase();
+    const permissionSet = new Set(
+      [
+        ...(Array.isArray(AppData.authUser?.permissions) ? AppData.authUser.permissions : []),
+        ...(Array.isArray(AppData.currentUser?.permissions) ? AppData.currentUser.permissions : []),
+      ].map((item) => String(item || '').trim().toLowerCase()).filter(Boolean)
+    );
+    const optionalSyncKeys = new Set();
+    const canManageUsers = role === 'admin' || role === 'qc_manager' || permissionSet.has('manage_users');
+    const canViewDashboard = role === 'admin' || role === 'qc_manager' || permissionSet.has('view_dashboard');
+    const canAccessQcQueue = role === 'admin' || permissionSet.has('qc_approve') || permissionSet.has('qc_reject');
+    if (!canManageUsers) optionalSyncKeys.add('users');
+    if (!canViewDashboard) optionalSyncKeys.add('shiftReports');
+    if (!canAccessQcQueue) optionalSyncKeys.add('qcQueue');
+    const [usersRes, libraryRes, historyRes, systemStatusRes, shiftConfigRes, activeWorkTaskRes, currentShiftSummaryRes, workTasksRes, providerSettingsRes, providerCatalogRes, shiftReportsRes, qcQueueRes] = await Promise.all([
       safeFetch('/api/auth/users'),
       safeFetch('/api/library'),
-      safeFetch('/api/history?limit=200'),
+      safeFetch('/api/history?limit=5000'),
       safeFetch('/api/system/status'),
       safeFetch('/api/system/shift-config'),
       safeFetch('/api/work-tasks/active' + (scopedUsername ? ('?user_name=' + encodeURIComponent(scopedUsername)) : '')),
       safeFetch('/api/reports/shift-current' + (scopedUsername ? ('?user_name=' + encodeURIComponent(scopedUsername)) : '')),
-      safeFetch('/api/work-tasks'),
+      safeFetch('/api/work-tasks?limit=5000'),
       safeFetch('/api/providers/settings'),
       safeFetch('/api/providers/catalog'),
       safeFetch('/api/reports/shifts'),
       safeFetch('/api/qc/queue'),
     ]);
+
+    const fetchMap = {
+      users: usersRes,
+      library: libraryRes,
+      history: historyRes,
+      system: systemStatusRes,
+      shiftConfig: shiftConfigRes,
+      activeWorkTask: activeWorkTaskRes,
+      currentShiftSummary: currentShiftSummaryRes,
+      workTasks: workTasksRes,
+      providerSettings: providerSettingsRes,
+      providerCatalog: providerCatalogRes,
+      shiftReports: shiftReportsRes,
+      qcQueue: qcQueueRes,
+    };
+    const syncErrors = Object.entries(fetchMap)
+      .filter(([key, row]) => !row?.ok && !optionalSyncKeys.has(String(key || '').trim()))
+      .map(([key, row]) => ({
+        key,
+        path: String(row?.path || '').trim(),
+        status: Number(row?.status || 0) || 0,
+        error: String(row?.error || '').trim(),
+      }));
+    AppData.syncHealth = {
+      fetchedAt: new Date().toISOString(),
+      hasErrors: syncErrors.length > 0,
+      stale: Object.fromEntries(Object.entries(fetchMap).map(([key, row]) => [key, !row?.ok && !optionalSyncKeys.has(String(key || '').trim())])),
+      errors: syncErrors,
+    };
+    const users = usersRes?.data;
+    const library = libraryRes?.data;
+    const history = historyRes?.data;
+    const systemStatus = systemStatusRes?.data;
+    const shiftConfig = shiftConfigRes?.data;
+    const activeWorkTask = activeWorkTaskRes?.data;
+    const currentShiftSummary = currentShiftSummaryRes?.data;
+    const workTasks = workTasksRes?.data;
+    const providerSettings = providerSettingsRes?.data;
+    const providerCatalog = providerCatalogRes?.data;
+    const shiftReports = shiftReportsRes?.data;
+    const qcQueue = qcQueueRes?.data;
+
+    handleFrontendVersionMismatch(systemStatus);
 
     const onlineUsers = Array.isArray(systemStatus?.online_staff) ? systemStatus.online_staff : [];
     const onlineMap = new Map(onlineUsers.map((u) => [String(u.username || ''), u]));
@@ -817,7 +1165,12 @@ async function loadDataFromAPI() {
       AppData.staff.splice(0, AppData.staff.length);
     }
     if (Array.isArray(library)) {
+      const existingByTaskId = new Map((Array.isArray(AppData.library) ? AppData.library : []).map((item) => [String(item?.taskId || item?.id || '').trim(), item]));
       const normalizedLibrary = library.map(normalizeLibraryItem).filter(shouldKeepLibraryItem);
+      normalizedLibrary.forEach((item) => {
+        const key = String(item?.taskId || item?.id || '').trim();
+        item.codeTag = getStableLibraryCodeTag(item, existingByTaskId.get(key));
+      });
       AppData.library.splice(0, AppData.library.length, ...normalizedLibrary);
     } else if (strictProd) {
       AppData.library.splice(0, AppData.library.length);
@@ -829,8 +1182,6 @@ async function loadDataFromAPI() {
     }
     if (Array.isArray(history)) {
       AppData.activityHistory.splice(0, AppData.activityHistory.length, ...history);
-    } else if (strictProd) {
-      AppData.activityHistory.splice(0, AppData.activityHistory.length);
     }
     if (Array.isArray(shiftReports)) {
       const normalizedShiftReports = shiftReports.map((row) => ({
@@ -864,21 +1215,26 @@ async function loadDataFromAPI() {
       AppData.shiftConfig = {};
     }
     AppData.providerSettings = {
-      default_provider: String(providerSettings?.default_provider || 'provider1').trim().toLowerCase() || 'provider1',
-      default_models: (providerSettings && typeof providerSettings.default_models === 'object' && providerSettings.default_models) ? providerSettings.default_models : { provider1: 'kling25_turbo_pro', provider2: 'kling25_turbo' },
+      default_provider: 'provider1',
+      default_models: {
+        provider1: String(providerSettings?.default_models?.provider1 || 'kling25_turbo_pro').trim() || 'kling25_turbo_pro',
+      },
       kie_credit_package: String(providerSettings?.kie_credit_package || 'usd50_10000').trim().toLowerCase() || 'usd50_10000',
-      provider2_endpoint: String(providerSettings?.provider2_endpoint || 'https://api.piapi.ai/api/v1/task').trim() || 'https://api.piapi.ai/api/v1/task',
     };
     if (providerCatalog && Array.isArray(providerCatalog.providers)) {
-      AppData.providerCatalog = providerCatalog;
-      const defaultProviderRow = providerCatalog.providers.find((row) => String(row.id || '') === String(AppData.providerSettings.default_provider || 'provider1'));
-      const defaultModelId = String(AppData.providerSettings?.default_models?.[AppData.providerSettings.default_provider] || '').trim();
+      AppData.providerCatalog = {
+        ...providerCatalog,
+        default_provider: 'provider1',
+        providers: providerCatalog.providers.filter((row) => String(row?.id || '').trim().toLowerCase() === 'provider1'),
+      };
+      const defaultProviderRow = AppData.providerCatalog.providers.find((row) => String(row.id || '') === 'provider1');
+      const defaultModelId = String(AppData.providerSettings?.default_models?.provider1 || '').trim();
       const defaultModelRow = Array.isArray(defaultProviderRow?.models) ? defaultProviderRow.models.find((row) => String(row.id || '') === defaultModelId) : null;
       if (defaultModelRow) {
         AppData.model = {
           id: String(defaultModelRow.id || ''),
           name: String(defaultModelRow.label || defaultModelRow.id || ''),
-          provider: String(defaultProviderRow.id || ''),
+          provider: 'provider1',
           cr5: Number(defaultModelRow.cost_5s || 0),
           cr10: Number(defaultModelRow.cost_10s || 0),
           unit: String(defaultModelRow.unit || ''),
@@ -886,6 +1242,7 @@ async function loadDataFromAPI() {
       }
     }
     const taskRows = Array.isArray(workTasks) ? workTasks : [];
+    AppData.workTasks = taskRows.slice();
     const viewTask = String(AppData.viewingAsUserId || '').trim()
       ? taskRows.find((row) => String(row.status || '').toLowerCase() === 'active' && String(row.user_name || '') === scopedUsername)
       : activeWorkTask;
@@ -929,6 +1286,16 @@ async function loadDataFromAPI() {
       AppData.images = Array.isArray(AppData.images) ? AppData.images : [];
       AppData.creditLog = Array.isArray(AppData.creditLog) ? AppData.creditLog : [];
       AppData.codes = Array.isArray(AppData.codes) ? AppData.codes : [];
+      AppData.workTasks = Array.isArray(AppData.workTasks) ? AppData.workTasks : [];
+    }
+    if (syncErrors.length && typeof showToast === 'function') {
+      const summary = syncErrors.map((row) => row.key).join('|');
+      if (summary !== _lastSyncHealthToastSignature) {
+        _lastSyncHealthToastSignature = summary;
+        showToast(`Đồng bộ chưa đầy đủ: ${syncErrors.map((row) => row.key).join(', ')}`, 'warning');
+      }
+    } else {
+      _lastSyncHealthToastSignature = '';
     }
   } catch (err) {
     if (strictProd) {
@@ -940,12 +1307,33 @@ async function loadDataFromAPI() {
       AppData.creditLog = [];
       AppData.activityHistory = [];
       AppData.codes = [];
+      AppData.workTasks = [];
       AppData.activeShift = null;
       AppData.activeShiftSummary = null;
       AppData.activeShiftReportSubmitted = false;
     }
+    AppData.syncHealth = {
+      fetchedAt: new Date().toISOString(),
+      hasErrors: true,
+      stale: {
+        users: true,
+        library: true,
+        history: true,
+        system: true,
+        shiftConfig: true,
+        activeWorkTask: true,
+        currentShiftSummary: true,
+        workTasks: true,
+        providerSettings: true,
+        providerCatalog: true,
+        shiftReports: true,
+        qcQueue: true,
+      },
+      errors: [{ key: 'loadDataFromAPI', path: 'bundle', status: 0, error: String(err?.message || '').trim() }],
+    };
     console.warn('[API] loadDataFromAPI failed:', err.message);
   }
+  renderSyncHealthStatus();
   renderActiveShiftHeader();
 }
 
@@ -957,27 +1345,45 @@ function normalizeLibraryItem(t) {
   const qcNote = String(t.qc_note || '').trim();
   let status = rawStatus;
   if (rawStatus === 'success' || rawStatus === 'completed') status = 'done';
-  if (rawStatus === 'pending') status = 'processing';
+  if (rawStatus === 'pending' || rawStatus === 'running' || rawStatus === 'queued') status = 'processing';
   if (qcStatus === 'pending' || qcStatus === 'pending_qc') status = 'pending_qc';
   if (qcStatus === 'approved') status = 'approved';
   if (qcStatus === 'rejected') status = 'rejected';
   const createdAt = t.created_at || t.completed_at || '';
+  const completedAt = t.completed_at || '';
   const fallbackName = t.result_url ? String(t.result_url).split('/').pop() : '';
   const name = t.output_filename || fallbackName || t.task_id || t.id || 'unknown';
+  const isFinalStatus = ['done', 'approved', 'rejected', 'pending_qc', 'fail', 'failed'].includes(status);
+  const resultUrl = isFinalStatus ? String(t.result_url || '').trim() : '';
+  const coverUrl = isFinalStatus ? String(t.cover_url || '').trim() : '';
+  const rawPct = Number(t.progress || t.pct || 0) || 0;
+  const pct = status === 'done' || status === 'approved' || status === 'rejected' || status === 'pending_qc'
+    ? 100
+    : Math.max(0, Math.min(99, rawPct));
   return {
     id: t.task_id || t.id,
     name,
     type,
     status,
-    codeTag: t.product_code || '',
+    codeTag: (typeof getCanonicalCodeTag === 'function' ? getCanonicalCodeTag(t.product_code || '') : String(t.product_code || '').trim()),
     sessionId: t.session_id || '',
     staffId: t.staff_id || t.user_name || '',
+    userName: String(t.user_name || '').trim(),
+    userDisplay: String(t.user_display || '').trim(),
     credits: Number(t.credit_used || 0),
+    pct,
+    progress: pct,
     taskId: t.task_id || t.id,
+    clientTaskId: String(t.client_task_id || t.clientTaskId || '').trim(),
     createdAt,
-    resultUrl: t.result_url || '',
-    coverUrl: t.cover_url || '',
+    completedAt,
+    executionTime: isFinalStatus
+      ? (String(t.execution_time || t.executionTime || '').trim() || formatLibraryExecutionTime(createdAt, completedAt))
+      : '',
+    resultUrl,
+    coverUrl,
     sourceUrl: t.source_url || '',
+    endSourceUrl: t.end_source_url || '',
     prompt: t.prompt || '',
     provider: t.provider || '',
     modelId: t.model_id || '',
@@ -987,12 +1393,30 @@ function normalizeLibraryItem(t) {
     cameraMove: t.camera_move || '',
     effectGroup: String(t.effect_group || 'custom').trim().toLowerCase() || 'custom',
     effectGroupDetail: String(t.effect_group_detail || '').trim(),
+    customerRequest: String(t.customer_request || t.customerRequest || '').trim(),
+    internalNote: String(t.internal_note || t.internalNote || '').trim(),
     qcStatus: qcStatus || null,
     qcNote: qcNote || '',
     rejectReason: String(t.reject_reason || '').trim(),
     qcReviewer: String(t.qc_reviewer || '').trim(),
     qcReviewedAt: t.qc_reviewed_at || '',
   };
+}
+
+function formatLibraryExecutionTime(startValue, endValue = '') {
+  const startRaw = String(startValue || '').trim();
+  if (!startRaw) return '';
+  const startMs = Date.parse(startRaw);
+  if (!Number.isFinite(startMs)) return '';
+  const endRaw = String(endValue || '').trim();
+  if (!endRaw) return '';
+  const endMs = endRaw ? Date.parse(endRaw) : Date.now();
+  if (!Number.isFinite(endMs) || endMs < startMs) return '';
+  const totalSeconds = Math.max(0, Math.round((endMs - startMs) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes <= 0) return `${seconds} giây`;
+  return `${minutes} phút ${seconds} giây`;
 }
 
 function getLibraryCollectionSignature(items) {
@@ -1008,12 +1432,45 @@ function getLibraryCollectionSignature(items) {
   })));
 }
 
+function resolveQCQueueCodeTag(row) {
+  const direct = (typeof getCanonicalCodeTag === 'function'
+    ? getCanonicalCodeTag(row?.code_tag || row?.codeTag || '')
+    : String(row?.code_tag || row?.codeTag || '').trim());
+  if (direct) return direct;
+  const taskId = String(row?.task_id || row?.taskId || '').trim();
+  const sessionId = String(row?.session_id || row?.sessionId || '').trim();
+  const libraryRows = Array.isArray(AppData?.library) ? AppData.library : [];
+  const matchedLibrary = libraryRows.find((item) => {
+    const itemTaskId = String(item?.taskId || item?.id || '').trim();
+    const itemSessionId = String(item?.sessionId || item?.session_id || '').trim();
+    if (taskId && itemTaskId && itemTaskId === taskId) return true;
+    if (sessionId && itemSessionId && itemSessionId === sessionId) return true;
+    return false;
+  }) || null;
+  const libraryCode = (typeof getCanonicalCodeTag === 'function'
+    ? getCanonicalCodeTag(matchedLibrary?.codeTag || matchedLibrary?.code_tag || '')
+    : String(matchedLibrary?.codeTag || matchedLibrary?.code_tag || '').trim());
+  if (libraryCode) return libraryCode;
+  const historyRows = Array.isArray(AppData?.activityHistory) ? AppData.activityHistory : [];
+  const matchedHistory = historyRows.find((item) => {
+    const itemTaskId = String(item?.task_id || item?.taskId || '').trim();
+    const itemSessionId = String(item?.session_id || item?.sessionId || '').trim();
+    if (taskId && itemTaskId && itemTaskId === taskId) return true;
+    if (sessionId && itemSessionId && itemSessionId === sessionId) return true;
+    return false;
+  }) || null;
+  return (typeof getCanonicalCodeTag === 'function'
+    ? getCanonicalCodeTag(matchedHistory?.code_tag || matchedHistory?.product_code || '')
+    : String(matchedHistory?.code_tag || matchedHistory?.product_code || '').trim());
+}
+
 function normalizeQCQueueItem(row) {
   if (!row || typeof row !== 'object') return null;
   const submittedAtRaw = Number(row.submitted_at || row.submittedAt || 0);
   const submittedAt = Number.isFinite(submittedAtRaw) ? submittedAtRaw : 0;
   const taskId = String(row.task_id || row.taskId || '').trim();
   const videoUrl = String(row.video_url || row.videoUrl || '').trim();
+  const codeTag = resolveQCQueueCodeTag(row);
   return {
     id: String(row.id || '').trim(),
     qcId: String(row.id || '').trim(),
@@ -1025,16 +1482,21 @@ function normalizeQCQueueItem(row) {
     userDisplay: String(row.user_display || row.userDisplay || '').trim(),
     staffId: String(row.user_name || row.userName || '').trim(),
     sessionId: String(row.session_id || row.sessionId || '').trim(),
-    codeTag: String(row.code_tag || row.codeTag || '').trim(),
+    codeTag,
     taskIndex: Number(row.task_index || row.taskIndex || 0),
     prompt: String(row.prompt || '').trim(),
     effectGroup: String(row.effect_group || row.effectGroup || '').trim().toLowerCase(),
     effectGroupDetail: String(row.effect_group_detail || row.effectGroupDetail || '').trim(),
+    customerRequest: String(row.customer_request || row.customerRequest || '').trim(),
+    internalNote: String(row.internal_note || row.internalNote || '').trim(),
     provider: String(row.provider || '').trim().toLowerCase(),
     modelId: String(row.model_id || row.modelId || '').trim(),
+    modelLabel: String(row.model_label || row.modelLabel || row.model_id || row.modelId || '').trim(),
     genMode: String(row.gen_mode || row.genMode || '').trim(),
     duration: String(row.duration || '').trim(),
     aspectRatio: String(row.aspect_ratio || row.aspectRatio || '').trim(),
+    sourceUrl: String(row.source_url || row.sourceUrl || '').trim(),
+    endSourceUrl: String(row.end_source_url || row.endSourceUrl || '').trim(),
     creditUsed: Number(row.credit_used || row.creditUsed || 0),
     note: String(row.note || '').trim(),
     status: String(row.status || 'pending').trim().toLowerCase() || 'pending',
@@ -1045,13 +1507,35 @@ function normalizeQCQueueItem(row) {
     claimedBy: String(row.claimed_by || row.claimedBy || '').trim(),
     claimedDisplay: String(row.claimed_display || row.claimedDisplay || '').trim(),
     claimedAt: Number(row.claimed_at || row.claimedAt || 0),
+    createdAt: String(row.created_at || row.createdAt || '').trim(),
+    createdAtText: String(row.created_at || row.createdAt || '').trim()
+      ? String(row.created_at || row.createdAt || '').trim()
+      : '-',
     submittedAt,
     submittedAtText: submittedAt ? new Date(submittedAt * 1000).toLocaleString('vi-VN') : '-',
     reviewedAt: Number(row.reviewed_at || row.reviewedAt || 0),
     mediaType: 'video',
     type: 'video',
-    name: String(row.code_tag || row.task_id || row.id || 'QC Item').trim(),
+    name: codeTag || String(row.task_id || row.id || 'QC Item').trim(),
   };
+}
+
+function getStableLibraryCodeTag(nextItem, existingItem = null) {
+  const nextRaw = typeof getCanonicalCodeTag === 'function'
+    ? getCanonicalCodeTag(nextItem?.codeTag || nextItem?.product_code || '')
+    : String(nextItem?.codeTag || nextItem?.product_code || '').trim();
+  const nextReal = typeof getCanonicalCodeTag === 'function'
+    ? getCanonicalCodeTag(nextRaw, { stripPlaceholder: true })
+    : nextRaw;
+  if (nextReal) return nextRaw;
+  const existingRaw = typeof getCanonicalCodeTag === 'function'
+    ? getCanonicalCodeTag(existingItem?.codeTag || existingItem?.product_code || '')
+    : String(existingItem?.codeTag || existingItem?.product_code || '').trim();
+  const existingReal = typeof getCanonicalCodeTag === 'function'
+    ? getCanonicalCodeTag(existingRaw, { stripPlaceholder: true })
+    : existingRaw;
+  if (existingReal) return existingRaw;
+  return nextRaw || existingRaw || '';
 }
 
 function setQCQueueData(rows) {
@@ -1079,6 +1563,18 @@ function shouldKeepLibraryItem(item) {
   const status = String(item.status || '').trim().toLowerCase();
   if (['processing', 'running', 'pending', 'queued', 'pending_qc'].includes(status)) return true;
   return !!String(item.resultUrl || '').trim();
+}
+
+function canPreviewLibraryItem(item) {
+  if (!item || typeof item !== 'object') return false;
+  const resultUrl = String(item.resultUrl || '').trim();
+  if (!resultUrl) return false;
+  const type = String(item.type || item.mediaType || 'video').trim().toLowerCase();
+  if (type === 'image') return true;
+  const status = String(item.status || '').trim().toLowerCase();
+  const qcStatus = String(item.qcStatus || '').trim().toLowerCase();
+  return ['done', 'approved', 'rejected', 'fail', 'failed', 'pending_qc'].includes(status)
+    || ['approved', 'rejected', 'pending_qc'].includes(qcStatus);
 }
 
 function formatLibraryCredits(value) {
@@ -1136,11 +1632,15 @@ function logout() {
     return;
   }
   resetClientAuthState();
+  if (window.AppMonitor && typeof window.AppMonitor.addEvent === 'function') window.AppMonitor.addEvent('logout', 'manual', 'info');
   showLoginScreen();
 }
 
 // ---- INIT ----
 document.addEventListener('DOMContentLoaded', async () => {
+  if (window.AppMonitor && typeof window.AppMonitor.installWrappers === 'function') {
+    window.AppMonitor.installWrappers();
+  }
   const token = API.getToken();
   const savedUser = API.getUser();
   if (token && savedUser) {
@@ -1157,34 +1657,71 @@ document.addEventListener('DOMContentLoaded', async () => {
   restoreRecoverPendingState();
 });
 
+window.__docsPortalOpenAt = 0;
+
 window.addEventListener('beforeunload', (event) => {
+  const docsPortalOpenAt = Number(window.__docsPortalOpenAt || 0);
+  if (docsPortalOpenAt && (Date.now() - docsPortalOpenAt) < 1500) return;
   if (!isStrictStaffShiftLock() || !AppData.activeShift) return;
   event.preventDefault();
   event.returnValue = '';
 });
 
 
+function _setScreenInitError(containerId, title, err) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  const msg = String(err && err.message ? err.message : err || 'Unknown error').trim() || 'Unknown error';
+  el.innerHTML = `<div class="card"><div class="card-title">${title}</div><div style="color:var(--red);font-size:13px;white-space:normal">Khởi tạo màn hình thất bại: ${msg.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div></div>`;
+}
+
+function _safeInitScreen(label, containerId, builder) {
+  try {
+    builder();
+  } catch (err) {
+    console.warn(`[screen] ${label} init failed:`, err && err.message ? err.message : err);
+    _setScreenInitError(containerId, label, err);
+  }
+}
+
 function initAllScreens() {
-  buildDashboard();
-  buildCreator(); // defined in creator.js
-  if (canAccessScreen('qc')) buildQC();
+  _safeInitScreen('Dashboard', 'dashboardContent', () => buildDashboard());
+  _safeInitScreen('Creator Workspace', 'creatorContent', () => buildCreator()); // defined in creator.js
+  if (canAccessScreen('qc')) _safeInitScreen('QC', 'qcContent', () => buildQC());
   else {
     const el = document.getElementById('qcContent');
     if (el) el.innerHTML = '<div class="card"><div class="card-title">Admin/QC only</div><div style="color:var(--muted);font-size:13px">Ban khong co quyen truy cap man hinh nay.</div></div>';
   }
-  if (canAccessScreen('hr')) buildHR();
+  if (canAccessScreen('hr')) _safeInitScreen('HR', 'hrContent', () => buildHR());
   else {
     const el = document.getElementById('hrContent');
     if (el) el.innerHTML = '<div class="card"><div class="card-title">Admin only</div><div style="color:var(--muted);font-size:13px">Ban khong co quyen truy cap man hinh nay.</div></div>';
   }
-  buildLibrary();
-  buildCreditsScreen();
-  if (canAccessScreen('settings')) buildSettings();
+  _safeInitScreen('Library', 'libraryContent', () => buildLibrary());
+  _safeInitScreen('Preset Manager', 'presetManagerContent', () => buildPresetManager());
+  _safeInitScreen('Credits', 'creditsContent', () => buildCreditsScreen());
+  if (canAccessScreen('announce')) _safeInitScreen('Thông báo', 'announceContent', () => buildAnnouncementsScreen());
+  else {
+    const el = document.getElementById('announceContent');
+    if (el) el.innerHTML = '<div class="card"><div class="card-title">Admin only</div><div style="color:var(--muted);font-size:13px">Ban khong co quyen truy cap man hinh nay.</div></div>';
+  }
+  if (canAccessScreen('settings')) _safeInitScreen('Settings', 'settingsContent', () => buildSettings());
   else {
     const el = document.getElementById('settingsContent');
     if (el) el.innerHTML = '<div class="card"><div class="card-title">Admin only</div><div style="color:var(--muted);font-size:13px">Ban khong co quyen truy cap man hinh nay.</div></div>';
   }
-  normalizeMojibakeDom(document);
+  try {
+    normalizeMojibakeDom(document);
+  } catch (err) {
+    console.warn('[screen] normalizeMojibakeDom failed:', err && err.message ? err.message : err);
+  }
+  try {
+    if (window.AppMonitor && typeof window.AppMonitor.installWrappers === 'function') {
+      window.AppMonitor.installWrappers();
+    }
+  } catch (err) {
+    console.warn('[screen] AppMonitor.installWrappers failed:', err && err.message ? err.message : err);
+  }
 }
 
 const ScreenPermissionMap = {
@@ -1193,14 +1730,16 @@ const ScreenPermissionMap = {
   qc: 'qc_approve',
   hr: 'manage_users',
   library: 'view_library',
+  presets: '',
   credits: '',
+  announce: 'manage_settings',
   settings: 'manage_settings',
 };
 
 function getScreenBlockReason(screenId) {
   const role = String(AppData.currentUser?.role || '').toLowerCase();
-  if (role === 'qc_manager' && !['dashboard', 'qc'].includes(String(screenId || '').toLowerCase())) {
-    return 'Role QC chỉ được truy cập Dashboard và QC';
+  if (role === 'qc_manager' && !['dashboard', 'qc', 'presets'].includes(String(screenId || '').toLowerCase())) {
+    return 'Role QC chỉ được truy cập Dashboard, QC và Preset Manager';
   }
   if (screenId === 'creator' && String(AppData.currentUser?.role || '').toLowerCase() === 'staff' && !AppData.activeShift) {
     return 'Phải bắt đầu ca ở Dashboard trước khi vào Creator Workspace';
@@ -1219,6 +1758,7 @@ function canAccessScreen(screenId) {
 function applyRoleAccessUI() {
   const roleModal = document.getElementById('roleModal');
   const headerAvatar = document.querySelector('.header-avatar');
+  const role = String(AppData.currentUser?.role || '').toLowerCase();
   const canSwitch = canUseRoleSwitcher();
   if (roleModal && !canSwitch) roleModal.style.display = 'none';
   if (headerAvatar) {
@@ -1227,15 +1767,33 @@ function applyRoleAccessUI() {
   }
 
   document.querySelectorAll('.nav-item').forEach((nav) => {
+    if (nav.classList.contains('nav-item-external')) {
+      nav.style.display = AppData.currentUser ? '' : 'none';
+      nav.classList.remove('disabled');
+      nav.title = '';
+      return;
+    }
     const screenId = nav.getAttribute('data-screen');
     const allowed = canAccessScreen(screenId);
     nav.style.display = allowed ? '' : 'none';
     nav.classList.toggle('disabled', !allowed);
     nav.title = getScreenBlockReason(screenId) || '';
+    if (screenId === 'credits') {
+      const label = nav.querySelector('span');
+      if (label) label.textContent = role === 'staff' ? 'Histories' : 'Credits';
+    }
   });
 
+  const creditDisplay = document.querySelector('.credit-display');
+  const creditRows = document.querySelectorAll('.credit-display .credit-row');
+  const creditP1Label = creditRows[0]?.querySelector('.credit-label');
+  if (creditDisplay) creditDisplay.style.display = role === 'qc_manager' ? 'none' : '';
+  if (creditP1Label) creditP1Label.innerHTML = role === 'admin'
+    ? '<i class="fa-solid fa-coins"></i> Server 1'
+    : '<i class="fa-solid fa-coins"></i> Credits';
+
   if (!canAccessScreen(currentScreen)) {
-    const fallback = ['dashboard', 'library', 'credits', 'creator', 'qc', 'hr', 'settings'].find((screenId) => canAccessScreen(screenId));
+    const fallback = ['dashboard', 'presets', 'library', 'credits', 'creator', 'qc', 'hr', 'settings'].find((screenId) => canAccessScreen(screenId));
     if (fallback) switchScreen(fallback);
   }
 }
@@ -1258,14 +1816,13 @@ function renderActiveShiftHeader() {
   const hours = Math.floor(totalMinutes / 60);
   const minutes = totalMinutes % 60;
   el.innerHTML = `
-    <div style="display:flex;align-items:center;justify-content:space-between;width:100%;padding:8px 14px;border:1px solid rgba(85,190,120,.35);border-radius:10px;background:rgba(45,120,65,.14)">
+    <div style="display:flex;align-items:center;width:100%;padding:8px 14px;border:1px solid rgba(85,190,120,.35);border-radius:10px;background:rgba(45,120,65,.14)">
       <div style="display:flex;align-items:center;gap:12px;min-width:0">
         <span style="font-size:13px;font-weight:800;color:#7CFF9A">CA ĐANG MỞ</span>
         <span style="font-size:13px;color:#EAF7EE;font-weight:700">${AppData.activeShift.shiftLabel || AppData.activeShift.title || 'Ca làm việc'}</span>
         <span style="font-size:12px;color:#9FDBAE">${validStarted ? startedAt.toLocaleString('vi-VN') : '-'}</span>
         <span style="font-size:12px;color:#7CFF9A;font-weight:700">${hours} giờ ${minutes} phút</span>
       </div>
-      <button class="btn-danger btn-sm" onclick="finishActiveShiftFlow()"><i class="fa-solid fa-stop"></i> Kết thúc ca</button>
     </div>
   `;
   _activeShiftTimer = setTimeout(renderActiveShiftHeader, 30000);
@@ -1282,15 +1839,61 @@ function switchScreen(screenId, navEl) {
   const target = document.getElementById('screen-' + screenId);
   if (target) target.classList.add('active');
   currentScreen = screenId;
+  if (window.AppMonitor && typeof window.AppMonitor.setContext === 'function') {
+    window.AppMonitor.setContext({ currentScreen: String(screenId || '') });
+    if (typeof window.AppMonitor.addEvent === 'function') window.AppMonitor.addEvent('switch_screen', String(screenId || ''), 'info');
+  }
+  if (!['settings', 'announce'].includes(String(screenId || '')) && typeof stopSettingsMonitorRefresh === 'function') {
+    stopSettingsMonitorRefresh();
+  }
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
   const navLink = navEl || document.querySelector(`[data-screen="${screenId}"]`);
   if (navLink) navLink.classList.add('active');
   if (target) normalizeMojibakeDom(target);
+  renderSyncHealthStatus();
+  if (screenId === 'presets' && typeof buildPresetManager === 'function') {
+    buildPresetManager();
+    if (typeof loadPromptPresetManager === 'function') loadPromptPresetManager(true);
+  }
 }
 
 // ---- SIDEBAR ----
 function toggleSidebar() {
   document.getElementById('sidebar').classList.toggle('collapsed');
+}
+
+function openDocsPortal(event, navEl) {
+  if (event && typeof event.preventDefault === 'function') event.preventDefault();
+  if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
+  if (event && typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+  try {
+    window.__docsPortalOpenAt = Date.now();
+    const token = (typeof API !== 'undefined' && API && typeof API.getToken === 'function') ? API.getToken() : '';
+    const user = (typeof API !== 'undefined' && API && typeof API.getUser === 'function') ? API.getUser() : null;
+    if (token) localStorage.setItem('fa_docs_portal_token', token);
+    if (user) localStorage.setItem('fa_docs_portal_user', JSON.stringify(user));
+    const targetUrl = new URL('/docs.html', window.location.origin);
+    if (navEl) {
+      navEl.blur();
+    }
+    const opened = window.open(targetUrl.toString(), '_blank', 'noopener');
+    if (!opened) {
+      window.alert('Trình duyệt đang chặn tab Tài liệu. Hãy cho phép popup cho website này.');
+    }
+  } catch (_) {
+    window.alert('Không thể mở tab Tài liệu.');
+  }
+  return false;
+}
+
+function cacheDocsPortalContext() {
+  try {
+    const token = (typeof API !== 'undefined' && API && typeof API.getToken === 'function') ? API.getToken() : '';
+    const user = (typeof API !== 'undefined' && API && typeof API.getUser === 'function') ? API.getUser() : null;
+    if (token) localStorage.setItem('fa_docs_portal_token', token);
+    if (user) localStorage.setItem('fa_docs_portal_user', JSON.stringify(user));
+  } catch (_) {}
+  return true;
 }
 
 // ---- CODE CHIPS ----
@@ -1343,7 +1946,7 @@ function showRoleSwitcher() {
       .sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
     const currentViewId = String(AppData.viewingAsUserId || '');
     options.innerHTML =
-      `<div class="role-option" onclick="switchViewToOwnAccount()">
+      `<div class="role-option role-option-wide ${currentViewId ? '' : 'active'}" onclick="switchViewToOwnAccount()">
         <i class="fa-solid fa-rotate-left"></i>
         <div>
           <strong>${currentViewId ? 'Tr\u1edf v\u1ec1 t\u00e0i kho\u1ea3n g\u1ed1c' : '\u0110ang d\u00f9ng t\u00e0i kho\u1ea3n g\u1ed1c'}</strong>
@@ -1351,11 +1954,12 @@ function showRoleSwitcher() {
         </div>
       </div>` +
       switchableUsers.map((s) => `
-        <div class="role-option" onclick="switchViewAsStaff('${String(s.id).replace(/'/g, "\\'")}')">
+        <div class="role-option ${currentViewId === String(s.id) ? 'active' : ''}" onclick="switchViewAsStaff('${String(s.id).replace(/'/g, "\\'")}')">
           <i class="fa-solid fa-user"></i>
           <div>
             <strong>${String(s.name || s.username || '-')}</strong>
-            <p>${String(s.username || '-')} (${String(s.role || '-')}) ${currentViewId === String(s.id) ? '\u2022 \u0111ang xem' : ''}</p>
+            <p>${String(s.username || '-')} (${String(s.role || '-')})</p>
+            ${currentViewId === String(s.id) ? '<span class="role-option-state">\u0110ang xem</span>' : ''}
           </div>
         </div>
       `).join('');
@@ -1406,7 +2010,7 @@ async function switchViewToOwnAccount() {
   initAllScreens();
   renderActiveShiftHeader();
   if (!canAccessScreen(currentScreen)) {
-    const fallback = ['dashboard', 'library', 'credits', 'creator', 'qc', 'hr', 'settings'].find((screenId) => canAccessScreen(screenId));
+    const fallback = ['dashboard', 'presets', 'library', 'credits', 'creator', 'qc', 'hr', 'settings'].find((screenId) => canAccessScreen(screenId));
     if (fallback) switchScreen(fallback);
   }
   showToast('Đã trở về tài khoản gốc', 'success');
@@ -1448,7 +2052,7 @@ async function switchViewAsStaff(staffId) {
   applyRoleAccessUI();
   initAllScreens();
   renderActiveShiftHeader();
-  const fallback = ['dashboard', 'library', 'credits', 'creator'].find((screenId) => canAccessScreen(screenId));
+  const fallback = ['dashboard', 'presets', 'library', 'credits', 'creator'].find((screenId) => canAccessScreen(screenId));
   if (fallback) switchScreen(fallback);
   showToast(`Đang xem với tài khoản ${staff.name || staff.username}`, 'info');
 }
@@ -1472,12 +2076,313 @@ function closeModal(id) {
 
 // ---- NOTIFICATIONS ----
 let _lastUnreadNotificationCount = 0;
+let _clientNotifications = [];
+let _notificationPopupQueue = [];
+let _activeNotificationPopupId = null;
+let _notificationPopupHideTimer = null;
+let _notificationPopupTickTimer = null;
+const _queuedNotificationPopupIds = new Set();
+const _seenNotificationToastIds = new Set();
+const _handledPresetShareNotificationIds = new Set();
+const NOTIFICATION_POPUP_SEEN_STORAGE_KEY = 'notification_popup_seen_ids';
+const _seenNotificationPopupIds = (() => {
+  try {
+    const raw = window.sessionStorage ? sessionStorage.getItem(NOTIFICATION_POPUP_SEEN_STORAGE_KEY) : '[]';
+    const parsed = JSON.parse(String(raw || '[]'));
+    return new Set(Array.isArray(parsed) ? parsed.map((item) => String(item || '').trim()).filter(Boolean) : []);
+  } catch (_) {
+    return new Set();
+  }
+})();
+
+function pushClientNotification(title, body, data = {}) {
+  const taskId = String(data?.taskId || '').trim();
+  const type = String(data?.type || 'info').trim().toLowerCase();
+  const dedupeKey = `${type}:${taskId}:${String(title || '').trim()}`;
+  if (_clientNotifications.some((item) => item.dedupeKey === dedupeKey && !item.read)) return;
+  _clientNotifications.unshift({
+    id: `client_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    type,
+    title: String(title || 'Thông báo').trim() || 'Thông báo',
+    body: String(body || '').trim(),
+    data_json: JSON.stringify(data || {}),
+    created_at: new Date().toISOString(),
+    read: 0,
+    dedupeKey,
+  });
+  _clientNotifications = _clientNotifications.slice(0, 50);
+  const badgeEl = document.getElementById('notifBadge');
+  const unreadCount = _clientNotifications.filter((item) => !item.read).length + Number(_lastUnreadNotificationCount || 0);
+  if (badgeEl) badgeEl.textContent = String(unreadCount);
+}
+
+function parseNotificationData(item) {
+  if (!item || typeof item !== 'object') return {};
+  const direct = item.data;
+  if (direct && typeof direct === 'object' && !Array.isArray(direct)) return direct;
+  try {
+    const parsed = JSON.parse(String(item.data_json || '{}'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function getNotificationDisplayTime(value) {
+  const date = parseRuntimeDate(value);
+  return date ? date.toLocaleString('vi-VN') : String(value || '');
+}
+
+function normalizeNotificationItem(item) {
+  const row = item && typeof item === 'object' ? { ...item } : {};
+  row.id = String(row.id || '').trim();
+  row.type = String(row.type || 'info').trim();
+  row.title = String(row.title || 'Thông báo').trim() || 'Thông báo';
+  row.body = String(row.body || '').trim();
+  row.read = Number(row.read || 0) ? 1 : 0;
+  row.data = parseNotificationData(row);
+  row.createdLabel = getNotificationDisplayTime(row.created_at || row.createdAt || '');
+  return row;
+}
+
+function renderSyncHealthStatus() {
+  const el = document.getElementById('syncHealthText');
+  if (!el) return;
+  const health = (AppData && typeof AppData.syncHealth === 'object') ? AppData.syncHealth : null;
+  const staleKeys = (health && health.stale && typeof health.stale === 'object')
+    ? Object.entries(health.stale).filter(([, value]) => !!value).map(([key]) => String(key || '').trim()).filter(Boolean)
+    : [];
+  if (!health || !health.hasErrors || staleKeys.length === 0) {
+    el.textContent = 'Đồng bộ ổn';
+    el.style.color = 'var(--muted)';
+    el.title = 'Dữ liệu đang đồng bộ bình thường';
+    return;
+  }
+  el.textContent = `Đồng bộ lỗi: ${staleKeys.slice(0, 2).join(', ')}${staleKeys.length > 2 ? '...' : ''}`;
+  el.style.color = '#f2c24f';
+  el.title = (Array.isArray(health.errors) ? health.errors : [])
+    .map((row) => `${String(row?.key || '-').trim()}: ${String(row?.error || row?.status || 'Unknown').trim()}`)
+    .join(' | ');
+}
+
+async function handlePresetSharedNotifications(items) {
+  const rows = (Array.isArray(items) ? items : []).map(normalizeNotificationItem);
+  const hits = rows.filter((item) => {
+    const id = String(item.id || '').trim();
+    return id && !item.read && String(item.type || '').trim().toLowerCase() === 'preset_shared' && !_handledPresetShareNotificationIds.has(id);
+  });
+  if (!hits.length) return;
+  let creatorReloadOk = typeof ensureCreatorPromptPresets !== 'function';
+  let managerReloadOk = typeof loadPromptPresetManager !== 'function';
+  try {
+    if (typeof ensureCreatorPromptPresets === 'function') {
+      await ensureCreatorPromptPresets(true);
+      creatorReloadOk = true;
+    }
+  } catch (_) {}
+  try {
+    if (typeof loadPromptPresetManager === 'function') {
+      await loadPromptPresetManager(true);
+      managerReloadOk = true;
+    }
+  } catch (_) {}
+  if (!creatorReloadOk || !managerReloadOk) return;
+  hits.forEach((item) => _handledPresetShareNotificationIds.add(String(item.id || '').trim()));
+  if (currentScreen === 'presets' && typeof buildPresetManager === 'function') buildPresetManager();
+  showToast(hits.length === 1 ? 'Bạn vừa nhận 1 preset mới' : `Bạn vừa nhận ${hits.length} preset mới`, 'info');
+}
+
+function rememberSeenNotificationPopup(id) {
+  const normalizedId = String(id || '').trim();
+  if (!normalizedId) return;
+  _seenNotificationPopupIds.add(normalizedId);
+  try {
+    if (window.sessionStorage) {
+      sessionStorage.setItem(
+        NOTIFICATION_POPUP_SEEN_STORAGE_KEY,
+        JSON.stringify(Array.from(_seenNotificationPopupIds).slice(-200)),
+      );
+    }
+  } catch (_) {}
+}
+
+function markNotificationReadKeepalive(id) {
+  const normalizedId = String(id || '').trim();
+  if (!normalizedId) return;
+  try {
+    const token = (typeof API !== 'undefined' && API && typeof API.getToken === 'function')
+      ? String(API.getToken() || '').trim()
+      : '';
+    if (!token) return;
+    fetch(`/api/notifications/read/${encodeURIComponent(normalizedId)}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: '{}',
+      keepalive: true,
+      credentials: 'same-origin',
+    }).catch(() => {});
+  } catch (_) {}
+}
+
+function getNotificationPopupSeconds(item) {
+  const data = parseNotificationData(item);
+  return Math.max(3, Math.min(10, Number(data.popup_seconds || data.duration_seconds || 3) || 3));
+}
+
+function isPopupNotificationItem(item) {
+  const normalized = normalizeNotificationItem(item);
+  const type = String(normalized.type || '').trim().toLowerCase();
+  const data = normalized.data || {};
+  return !normalized.read && Boolean(data.popup) && type === 'admin_broadcast';
+}
+
+function ensureNotificationPopupStyle() {
+  if (document.getElementById('notificationPopupStyle')) return;
+  const style = document.createElement('style');
+  style.id = 'notificationPopupStyle';
+  style.textContent = `
+    .notice-popup-overlay{position:fixed;inset:0;background:rgba(0,0,0,.42);display:flex;align-items:center;justify-content:center;z-index:10030;padding:20px}
+    .notice-popup-card{width:min(520px,calc(100vw - 32px));background:var(--card);border:1px solid rgba(217,122,43,.45);border-radius:16px;box-shadow:0 16px 60px rgba(0,0,0,.5);overflow:hidden}
+    .notice-popup-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 18px;border-bottom:1px solid var(--border);background:rgba(217,122,43,.08)}
+    .notice-popup-title{font-size:16px;font-weight:800;color:var(--text)}
+    .notice-popup-count{min-width:42px;height:42px;border-radius:999px;display:inline-flex;align-items:center;justify-content:center;background:rgba(217,122,43,.15);color:var(--brand);font-size:18px;font-weight:900}
+    .notice-popup-body{padding:18px;font-size:15px;line-height:1.6;color:var(--text);white-space:pre-wrap;word-break:break-word}
+    .notice-popup-meta{display:flex;justify-content:space-between;gap:12px;padding:0 18px 14px;color:var(--muted);font-size:12px}
+    .notice-popup-actions{display:flex;justify-content:flex-end;gap:10px;padding:0 18px 16px}
+    .notice-popup-btn{height:38px;padding:0 16px;border-radius:10px;border:1px solid var(--border);background:var(--bg2);color:var(--text);font-size:13px;font-weight:700;cursor:pointer}
+    .notice-popup-btn:hover{filter:brightness(1.08)}
+    .notice-popup-btn.primary{border-color:rgba(217,122,43,.45);background:rgba(217,122,43,.14);color:var(--brand)}
+    .notice-popup-progress{height:4px;background:rgba(255,255,255,.06)}
+    .notice-popup-progress-bar{height:100%;width:100%;background:linear-gradient(90deg,var(--brand),#f2d479);transition:width .1s linear}
+  `;
+  document.head.appendChild(style);
+}
+
+function pumpNotificationPopupQueue() {
+  if (_activeNotificationPopupId || !_notificationPopupQueue.length) return;
+  const item = _notificationPopupQueue.shift();
+  if (!item) return;
+  const normalized = normalizeNotificationItem(item);
+  const popupId = String(normalized.id || '').trim();
+  if (!popupId) return;
+  _activeNotificationPopupId = popupId;
+  _queuedNotificationPopupIds.delete(popupId);
+  ensureNotificationPopupStyle();
+
+  const existing = document.getElementById('noticePopupOverlay');
+  if (existing) existing.remove();
+
+  const seconds = getNotificationPopupSeconds(normalized);
+  const forceRefresh = !!normalized.data?.force_refresh;
+  const overlay = document.createElement('div');
+  overlay.id = 'noticePopupOverlay';
+  overlay.className = 'notice-popup-overlay';
+  overlay.innerHTML = `
+    <div class="notice-popup-card" role="alertdialog" aria-live="assertive" aria-modal="true">
+      <div class="notice-popup-head">
+        <div>
+          <div class="notice-popup-title">${escapeHtml(normalized.title || 'Thông báo hệ thống')}</div>
+          <div style="margin-top:4px;font-size:12px;color:var(--muted)">${forceRefresh ? `Đếm ngược <span id="noticePopupSeconds">${seconds}</span> giây, popup sẽ tự làm mới` : `Đếm ngược <span id="noticePopupSeconds">${seconds}</span> giây, popup chỉ đóng khi bấm OK`}</div>
+        </div>
+        <div class="notice-popup-count" id="noticePopupCounter">${seconds}</div>
+      </div>
+      <div class="notice-popup-body">${escapeHtml(normalized.body || '')}</div>
+      <div class="notice-popup-meta">
+        <span>${escapeHtml(String(normalized.data?.created_by || 'Admin'))}</span>
+        <span>${escapeHtml(normalized.createdLabel || '')}</span>
+      </div>
+      <div class="notice-popup-actions">
+        ${forceRefresh ? '' : '<button type="button" class="notice-popup-btn" id="noticePopupOkBtn">OK</button>'}
+      </div>
+      <div class="notice-popup-progress"><div class="notice-popup-progress-bar" id="noticePopupProgress"></div></div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  const secondsEl = overlay.querySelector('#noticePopupSeconds');
+  const counterEl = overlay.querySelector('#noticePopupCounter');
+  const progressEl = overlay.querySelector('#noticePopupProgress');
+  const okBtn = overlay.querySelector('#noticePopupOkBtn');
+  const startedAt = Date.now();
+  const totalMs = seconds * 1000;
+
+  if (forceRefresh) {
+    rememberSeenNotificationPopup(popupId);
+    markNotificationReadKeepalive(popupId);
+  }
+
+  const clearPopupTimers = () => {
+    if (_notificationPopupTickTimer) {
+      clearInterval(_notificationPopupTickTimer);
+      _notificationPopupTickTimer = null;
+    }
+    if (_notificationPopupHideTimer) {
+      clearTimeout(_notificationPopupHideTimer);
+      _notificationPopupHideTimer = null;
+    }
+  };
+
+  const stopPopupTick = () => {
+    if (_notificationPopupTickTimer) {
+      clearInterval(_notificationPopupTickTimer);
+      _notificationPopupTickTimer = null;
+    }
+  };
+
+  const updatePopup = () => {
+    const elapsed = Math.min(totalMs, Math.max(0, Date.now() - startedAt));
+    const remainingMs = Math.max(0, totalMs - elapsed);
+    const remainingSeconds = Math.max(0, Math.ceil(remainingMs / 1000));
+    if (secondsEl) secondsEl.textContent = String(remainingSeconds);
+    if (counterEl) counterEl.textContent = String(remainingSeconds);
+    if (progressEl) progressEl.style.width = `${Math.max(0, 100 - ((elapsed / totalMs) * 100))}%`;
+    if (elapsed >= totalMs) stopPopupTick();
+  };
+
+  const closePopup = () => {
+    clearPopupTimers();
+    rememberSeenNotificationPopup(popupId);
+    markNotificationReadKeepalive(popupId);
+    const node = document.getElementById('noticePopupOverlay');
+    if (node) node.remove();
+    _activeNotificationPopupId = null;
+    window.setTimeout(() => {
+      pumpNotificationPopupQueue();
+    }, 120);
+  };
+
+  if (okBtn) okBtn.addEventListener('click', closePopup);
+
+  updatePopup();
+  _notificationPopupTickTimer = window.setInterval(updatePopup, 100);
+  if (forceRefresh) {
+    _notificationPopupHideTimer = window.setTimeout(() => {
+      closePopup();
+      performForcedFrontendRefresh();
+    }, totalMs);
+  }
+}
+
+function queueNotificationPopups(items) {
+  (Array.isArray(items) ? items : []).forEach((item) => {
+    const normalized = normalizeNotificationItem(item);
+    const popupId = String(normalized.id || '').trim();
+    if (!popupId || !isPopupNotificationItem(normalized)) return;
+    if (_seenNotificationPopupIds.has(popupId) || _queuedNotificationPopupIds.has(popupId) || _activeNotificationPopupId === popupId) return;
+    _queuedNotificationPopupIds.add(popupId);
+    _notificationPopupQueue.push(normalized);
+  });
+  pumpNotificationPopupQueue();
+}
 
 async function loadNotifications() {
   const listEl = document.getElementById('notifList');
   const badgeEl = document.getElementById('notifBadge');
   const header = document.querySelector('#notifPanel .notif-header');
-  if (!listEl || !badgeEl) return;
+  if (!badgeEl) return;
   if (header && !header.querySelector('.notif-mark-all')) {
     const actions = document.createElement('div');
     actions.style.display = 'flex';
@@ -1493,10 +2398,14 @@ async function loadNotifications() {
   }
   try {
     const items = await API.getNotifications();
-    const notifications = Array.isArray(items) ? items : [];
+    const serverNotifications = (Array.isArray(items) ? items : []).map(normalizeNotificationItem);
+    await handlePresetSharedNotifications(serverNotifications);
+    queueNotificationPopups(serverNotifications);
+    const notifications = [..._clientNotifications, ...serverNotifications].map(normalizeNotificationItem);
     const unreadCount = notifications.filter((n) => !n.read).length;
     badgeEl.textContent = String(unreadCount);
-    _lastUnreadNotificationCount = unreadCount;
+    _lastUnreadNotificationCount = Number(serverNotifications.filter((n) => !n.read).length || 0);
+    if (!listEl) return;
     if (notifications.length === 0) {
       listEl.innerHTML = '<div class="notif-item"><div class="notif-body"><div class="notif-title">Chưa có thông báo</div></div></div>';
       return;
@@ -1513,13 +2422,13 @@ async function loadNotifications() {
         : type.includes('reject') || type.includes('fail')
           ? 'fa-xmark'
           : 'fa-bell';
-      const created = item.created_at || item.createdAt || '';
+      const created = item.createdLabel || '';
       return '<div class="notif-item ' + (item.read ? '' : 'unread') + '" data-id="' + item.id + '" onclick="' + (item.read ? '' : 'markNotificationRead(&quot;' + String(item.id).replace(/\"/g, '&quot;') + '&quot;)') + '">' +
           '<div class="notif-icon ' + iconClass + '"><i class="fa-solid ' + icon + '"></i></div>' +
           '<div class="notif-body">' +
-            '<div class="notif-title">' + (item.title || 'Thông báo') + '</div>' +
-            '<div class="notif-text">' + (item.body || '') + '</div>' +
-            '<div class="notif-time">' + created + '</div>' +
+            '<div class="notif-title">' + escapeHtml(item.title || 'Thông báo') + '</div>' +
+            '<div class="notif-text">' + escapeHtml(item.body || '') + '</div>' +
+            '<div class="notif-time">' + escapeHtml(created) + '</div>' +
           '</div>' +
           (item.read ? '' : '<button class="btn-ghost btn-sm notif-mark-read" onclick="event.stopPropagation();markNotificationRead(&quot;' + String(item.id).replace(/\"/g, '&quot;') + '&quot;)"><i class="fa-solid fa-check"></i></button>') +
         '</div>';
@@ -1533,6 +2442,12 @@ async function loadNotifications() {
 async function markNotificationRead(id) {
   if (!id) return;
   try {
+    const localItem = _clientNotifications.find((item) => String(item.id) === String(id));
+    if (localItem) {
+      localItem.read = 1;
+      await loadNotifications();
+      return;
+    }
     await API.markNotifRead(id);
     await loadNotifications();
   } catch (_) {}
@@ -1540,6 +2455,7 @@ async function markNotificationRead(id) {
 
 async function markAllNotificationsRead() {
   try {
+    _clientNotifications.forEach((item) => { item.read = 1; });
     await API.markAllNotifRead();
     await loadNotifications();
   } catch (_) {}
@@ -1592,12 +2508,35 @@ async function refreshNotificationBadge() {
       return;
     }
     const result = await API.getNotificationUnreadCount();
-    const unreadCount = Number(result?.count || 0) || 0;
+    const serverUnreadCount = Number(result?.count || 0) || 0;
+    const unreadCount = serverUnreadCount + _clientNotifications.filter((item) => !item.read).length;
     badgeEl.textContent = String(unreadCount);
-    if (unreadCount > _lastUnreadNotificationCount) {
-      showToast('Có thông báo mới', 'info');
+    if (serverUnreadCount > _lastUnreadNotificationCount) {
+      const items = await API.getNotifications();
+      const serverNotifications = (Array.isArray(items) ? items : []).map(normalizeNotificationItem);
+      await handlePresetSharedNotifications(serverNotifications);
+      queueNotificationPopups(serverNotifications);
+      const hasNewUnreadToastable = serverNotifications.some((item) => {
+        const id = String(item.id || '').trim();
+        if (!id || item.read) return false;
+        if (isPopupNotificationItem(item)) return false;
+        if (_seenNotificationPopupIds.has(id) || _seenNotificationToastIds.has(id)) return false;
+        _seenNotificationToastIds.add(id);
+        return true;
+      });
+      if (hasNewUnreadToastable) showToast('Có thông báo mới', 'info');
+    } else if (unreadCount > _lastUnreadNotificationCount) {
+      const hasNewClientToastable = _clientNotifications.some((item) => {
+        const normalized = normalizeNotificationItem(item);
+        const id = String(normalized.id || '').trim();
+        if (!id || normalized.read) return false;
+        if (_seenNotificationPopupIds.has(id) || _seenNotificationToastIds.has(id)) return false;
+        _seenNotificationToastIds.add(id);
+        return true;
+      });
+      if (hasNewClientToastable) showToast('Có thông báo mới', 'info');
     }
-    _lastUnreadNotificationCount = unreadCount;
+    _lastUnreadNotificationCount = serverUnreadCount;
   } catch (_) {}
 }
 
@@ -1628,7 +2567,20 @@ function selectQCItem(el, name) {
   const role = String(AppData.currentUser?.role || '').trim().toLowerCase();
   if (item && role === 'qc_manager' && !String(item.assignedQcUser || '').trim()) {
     API.claimQC(item.id)
-      .then(async () => { await loadDataFromAPI(); buildQC(); })
+      .then(async (res) => {
+        if (!res || res.ok === false) {
+          const status = String(res?.status || '').trim().toLowerCase();
+          const message =
+            status === 'claimed_other' ? `Task đang được QC khác giữ${res?.claimed_display ? `: ${res.claimed_display}` : ''}` :
+            status === 'assigned_other' ? 'Task đang được giao cho QC khác' :
+            status === 'telegram_only' ? 'Task này chỉ duyệt qua Telegram/Admin' :
+            status === 'closed' ? 'Task này đã được xử lý' :
+            'Nhận task QC thất bại';
+          showToast(message, 'warning');
+        }
+        await loadDataFromAPI();
+        buildQC();
+      })
       .catch((err) => { showToast(err.message || 'Nhận task QC thất bại', 'error'); buildQC(); });
     return;
   }
@@ -1644,7 +2596,13 @@ async function approveItem() {
   if (!item) { showToast('Không tìm thấy item để duyệt', 'error'); return; }
   try {
     await API.approveQC(item.id, document.getElementById('qcComment')?.value || '');
+    if (window.AppMonitor && typeof window.AppMonitor.addEvent === 'function') window.AppMonitor.addEvent('qc_approve', String(item.codeTag || item.taskId || ''), 'info');
     await loadDataFromAPI();
+    try {
+      if (typeof renderLibraryIfChanged === 'function') renderLibraryIfChanged(true);
+      if (typeof _hydrateCreatorCombosFromRuntimeData === 'function') _hydrateCreatorCombosFromRuntimeData();
+      if (typeof syncCreatorQCFromLibrary === 'function') syncCreatorQCFromLibrary({ render: true });
+    } catch (_) {}
   } catch (err) {
     showToast(err.message || 'Approve thất bại', 'error');
     return;
@@ -1663,7 +2621,13 @@ async function rejectItem() {
   if (!item) { showToast('Không tìm thấy item để từ chối', 'error'); return; }
   try {
     await API.rejectQC(item.id, comment || 'Không đạt yêu cầu');
+    if (window.AppMonitor && typeof window.AppMonitor.addEvent === 'function') window.AppMonitor.addEvent('qc_reject', String(item.codeTag || item.taskId || ''), 'warn');
     await loadDataFromAPI();
+    try {
+      if (typeof renderLibraryIfChanged === 'function') renderLibraryIfChanged(true);
+      if (typeof _hydrateCreatorCombosFromRuntimeData === 'function') _hydrateCreatorCombosFromRuntimeData();
+      if (typeof syncCreatorQCFromLibrary === 'function') syncCreatorQCFromLibrary({ render: true });
+    } catch (_) {}
   } catch (err) {
     showToast(err.message || 'Reject thất bại', 'error');
     return;
@@ -1678,7 +2642,13 @@ async function releaseQCClaim() {
   if (!item) { showToast('Không tìm thấy item QC', 'error'); return; }
   try {
     await API.releaseQC(item.id);
-    await refreshQCQueue();
+    await loadDataFromAPI();
+    try {
+      if (typeof buildQC === 'function') buildQC();
+      if (typeof renderLibraryIfChanged === 'function') renderLibraryIfChanged(true);
+      if (typeof _hydrateCreatorCombosFromRuntimeData === 'function') _hydrateCreatorCombosFromRuntimeData();
+      if (typeof syncCreatorQCFromLibrary === 'function') syncCreatorQCFromLibrary({ render: true });
+    } catch (_) {}
     showToast('Đã nhả task QC', 'success');
   } catch (err) {
     showToast(err.message || 'Nhả task QC thất bại', 'error');
@@ -1691,12 +2661,58 @@ async function approveAll() {
 
   const queue = getQCQueue();
   if (queue.length === 0) { showToast('Queue trống', 'info'); return; }
+  const role = String(AppData.currentUser?.role || '').trim().toLowerCase();
+  const currentQcUsername = String(AppData.currentUser?.username || '').trim();
+  let okCount = 0;
+  let skipCount = 0;
+  let failCount = 0;
+  const failMessages = [];
   for (const item of queue) {
-    await API.approveQC(item.id, '');
+    try {
+      if (role === 'qc_manager') {
+        const assignedQcUser = String(item.assignedQcUser || '').trim();
+        const claimedBy = String(item.claimedBy || '').trim();
+        if (assignedQcUser && assignedQcUser !== currentQcUsername) {
+          skipCount += 1;
+          continue;
+        }
+        if (claimedBy && claimedBy !== currentQcUsername) {
+          skipCount += 1;
+          continue;
+        }
+        if (!claimedBy || claimedBy !== currentQcUsername) {
+          const claimRes = await API.claimQC(item.id);
+          if (!claimRes || claimRes.ok === false) {
+            skipCount += 1;
+            continue;
+          }
+        }
+      }
+      await API.approveQC(item.id, '');
+      okCount += 1;
+    } catch (err) {
+      failCount += 1;
+      const itemLabel = String(item.codeTag || item.taskId || item.id || '').trim() || 'unknown';
+      failMessages.push(`${itemLabel}: ${String(err?.message || err || 'error')}`);
+    }
   }
   await loadDataFromAPI();
+  if (typeof buildQC === 'function') buildQC();
+  try {
+    if (typeof renderLibraryIfChanged === 'function') renderLibraryIfChanged(true);
+    if (typeof _hydrateCreatorCombosFromRuntimeData === 'function') _hydrateCreatorCombosFromRuntimeData();
+    if (typeof syncCreatorQCFromLibrary === 'function') syncCreatorQCFromLibrary({ render: true });
+  } catch (_) {}
   checkCreditAlerts();
-  showToast(`Đã approve ${queue.length} items`, 'success');
+  if (okCount > 0 && failCount === 0 && skipCount === 0) {
+    showToast(`Đã duyệt ${okCount} items`, 'success');
+  } else if (okCount > 0) {
+    showToast(`Đã duyệt ${okCount}, bỏ qua ${skipCount}, lỗi ${failCount}`, failCount > 0 ? 'warning' : 'success');
+  } else if (skipCount > 0 && failCount === 0) {
+    showToast(`Không duyệt được item nào. Bỏ qua ${skipCount} items`, 'warning');
+  } else {
+    showToast(`Duyệt tất cả thất bại: ${failMessages[0] || 'unknown error'}`, 'error');
+  }
   buildQC();
   selectedQCItemId = null;
 }
@@ -1767,8 +2783,15 @@ function addStaff() {
           <input id="addStaffDisplayName" class="form-input" type="text" placeholder="Nhân viên 01">
         </div>
         <div>
+          <label class="form-label">Mã nhân viên</label>
+          <input id="addStaffEmployeeCode" class="form-input" type="text" placeholder="Nhập mã nhân viên">
+        </div>
+        <div>
           <label class="form-label">Mật khẩu</label>
-          <input id="addStaffPassword" class="form-input" type="password" placeholder="Nhập mật khẩu">
+          <div style="display:flex;gap:8px;align-items:center">
+            <input id="addStaffPassword" class="form-input" type="password" placeholder="Nhập mật khẩu">
+            <button class="btn-ghost btn-sm" type="button" onclick="togglePasswordInput('addStaffPassword', this)"><i class="fa-solid fa-eye"></i></button>
+          </div>
         </div>
         <div>
           <label class="form-label">Vai trò</label>
@@ -1797,6 +2820,7 @@ function closeAddStaffModal() {
 async function submitAddStaff() {
   const username = document.getElementById('addStaffUsername')?.value.trim();
   const displayName = document.getElementById('addStaffDisplayName')?.value.trim();
+  const employeeCode = document.getElementById('addStaffEmployeeCode')?.value.trim() || '';
   const password = document.getElementById('addStaffPassword')?.value || '';
   const role = document.getElementById('addStaffRole')?.value || 'staff';
   const errEl = document.getElementById('addStaffError');
@@ -1817,6 +2841,7 @@ async function submitAddStaff() {
       username,
       password,
       display_name: displayName || username,
+      employee_code: employeeCode,
       role,
     });
     await loadDataFromAPI();
@@ -1875,7 +2900,7 @@ function openStaffProfileModal(staffId, editable) {
         </div>
         <div style="grid-column:1 / -1">
           <label class="form-label">Mã nhân viên</label>
-          <input id="staffProfileEmployeeCode" class="form-input" type="text" value="${staff.employeeCode || ''}" ${disabled} placeholder="F0202">
+          <input id="staffProfileEmployeeCode" class="form-input" type="text" value="${staff.employeeCode || ''}" ${disabled} placeholder="Nhập mã nhân viên">
         </div>
         <div>
           <label class="form-label">Vai trò</label>
@@ -1906,7 +2931,10 @@ function openStaffProfileModal(staffId, editable) {
         ${editable ? `
         <div style="grid-column:1 / -1">
           <label class="form-label">Mật khẩu mới</label>
-          <input id="staffProfilePassword" class="form-input" type="password" placeholder="Để trống nếu không đổi">
+          <div style="display:flex;gap:8px;align-items:center">
+            <input id="staffProfilePassword" class="form-input" type="password" placeholder="Để trống nếu không đổi">
+            <button class="btn-ghost btn-sm" type="button" onclick="togglePasswordInput('staffProfilePassword', this)"><i class="fa-solid fa-eye"></i></button>
+          </div>
         </div>` : ''}
         <div id="staffProfileError" style="grid-column:1 / -1;display:none;color:var(--red);font-size:12px"></div>
       </div>
@@ -1932,6 +2960,14 @@ function editCurrentAdminProfile() {
     return;
   }
   openStaffProfileModal(AppData.currentUser.id, true);
+}
+
+function togglePasswordInput(inputId, btnEl) {
+  const input = document.getElementById(String(inputId || '').trim());
+  if (!input) return;
+  input.type = input.type === 'password' ? 'text' : 'password';
+  const icon = btnEl && typeof btnEl.querySelector === 'function' ? btnEl.querySelector('i') : null;
+  if (icon) icon.className = input.type === 'password' ? 'fa-solid fa-eye' : 'fa-solid fa-eye-slash';
 }
 
 async function submitStaffProfile(staffId) {
@@ -1999,26 +3035,34 @@ async function deleteStaff(staffId, fromModal = false) {
 function previewMedia(name, id = null) {
   let item = null;
   if (id !== null && id !== undefined) {
-    item = AppData.library.find(i => String(i.id) === String(id));
+    item = AppData.library.find(i => String(i.id || '') === String(id) || String(i.taskId || '') === String(id));
   }
   if (!item) {
-    item = AppData.library.find(i => i.name === name);
+    const candidates = AppData.library.filter(i => String(i.name || '') === String(name || ''));
+    if (candidates.length > 1) {
+      showToast('Tên media bị trùng, cần mở theo id/task cụ thể', 'warning');
+      return;
+    }
+    item = candidates.length === 1 ? candidates[0] : null;
   }
   if (!item) {
     showToast(`Không tìm thấy media: ${name}`, 'error');
     return;
   }
-  if (!item.resultUrl) {
-    showToast('Media chưa có result_url để xem', 'warning');
+  if (!canPreviewLibraryItem(item)) {
+    showToast('Media chưa có video kết quả ổn định để xem', 'warning');
     return;
   }
 
   const oldModal = document.getElementById('libraryPreviewModal');
   if (oldModal) oldModal.remove();
 
+  const qcApproved = String(item.qcStatus || item.status || '').trim().toLowerCase() === 'approved';
   const mediaHtml = item.type === 'image'
     ? `<img src="${item.resultUrl}" alt="${item.name}" style="max-width:min(92vw,1200px);max-height:78vh;display:block;border-radius:12px;background:#111">`
-    : `<video src="${item.resultUrl}" controls autoplay style="max-width:min(92vw,1200px);max-height:78vh;display:block;border-radius:12px;background:#111"></video>`;
+    : (qcApproved
+      ? `<video src="${item.resultUrl}" controls controlsList="nodownload noplaybackrate noremoteplayback" disablepictureinpicture autoplay playsinline preload="metadata" oncontextmenu="return false;" style="max-width:min(92vw,1200px);max-height:78vh;display:block;border-radius:12px;background:#111"></video>`
+      : `<video src="${item.resultUrl}" autoplay loop muted playsinline preload="metadata" oncontextmenu="return false;" style="max-width:min(92vw,1200px);max-height:78vh;display:block;border-radius:12px;background:#111"></video>`);
 
   const modal = document.createElement('div');
   modal.id = 'libraryPreviewModal';
@@ -2205,67 +3249,7 @@ function _appendAnalyzeResponseBubble(resp, fileName = '') {
 }
 
 async function sendChat() {
-  const input = document.getElementById('chatInput');
-  if (!input) return;
-  const msg = input.value.trim();
-  const attachment = aiChatAttachment && aiChatAttachment.file ? aiChatAttachment : null;
-  if (!msg && !attachment) return;
-  
-  const chatEl = document.getElementById('chatMessages');
-  if (!chatEl) return;
-  const userMessageText = attachment
-    ? `${attachment.name}${msg ? `\nYêu cầu: ${msg}` : '\nYêu cầu: Phân tích ảnh và gợi ý prompt.'}`
-    : msg;
-  aiChatMessages.push({ role: 'user', content: userMessageText });
-  renderChatHistory();
-  input.value = '';
-  input.disabled = true;
-  const uploadBtn = document.querySelector('.ai-upload-btn');
-  if (uploadBtn) uploadBtn.setAttribute('disabled', 'disabled');
-  await saveChatHistory();
-  const loadingId = `ai-loading-${Date.now()}`;
-  chatEl.innerHTML += `<div class="chat-bubble ai" id="${loadingId}"><i class="fa-solid fa-spinner fa-spin"></i> Trợ lý prompt đang xử lý...</div>`;
-  chatEl.scrollTop = chatEl.scrollHeight;
-
-  try {
-    if (attachment) {
-      const fd = new FormData();
-      fd.append('file', attachment.file, attachment.name || attachment.file.name || 'image');
-      fd.append('user_prompt', msg || 'Phân tích ảnh và gợi ý prompt.');
-      const resp = await API.chatAnalyze(fd);
-      const text = _buildAnalyzeResponseText(resp, attachment.name);
-      aiChatMessages.push({ role: 'assistant', content: text });
-      renderChatHistory();
-      _appendAnalyzeResponseBubble(resp, attachment.name);
-      clearChatAttachment({ silent: true });
-    } else {
-      const result = await API.chatAgent([
-        {
-          role: 'user',
-          content: [
-            { type: 'text', text: msg },
-          ],
-        },
-      ], 'gemini-2.5-flash');
-      const resp = extractChatText(result) || 'Không có nội dung trả về từ AI.';
-      aiChatMessages.push({ role: 'assistant', content: resp });
-      renderChatHistory();
-    }
-    await saveChatHistory();
-  } catch (err) {
-    const msgErr = err && err.message ? err.message : 'Gọi AI thất bại';
-    const loadingEl = document.getElementById(loadingId);
-    if (loadingEl) {
-      loadingEl.outerHTML = `<div class="chat-bubble ai"><i class="fa-solid fa-triangle-exclamation" style="color:var(--red)"></i> ${msgErr}</div>`;
-    } else {
-      chatEl.innerHTML += `<div class="chat-bubble ai"><i class="fa-solid fa-triangle-exclamation" style="color:var(--red)"></i> ${msgErr}</div>`;
-    }
-  } finally {
-    input.disabled = false;
-    if (uploadBtn) uploadBtn.removeAttribute('disabled');
-    input.focus();
-    chatEl.scrollTop = chatEl.scrollHeight;
-  }
+  return;
 }
 
 async function saveChatHistory() {
@@ -2275,33 +3259,19 @@ async function saveChatHistory() {
 }
 
 async function loadChatHistory() {
-  try {
-    const saved = await API.getChatHistory(AI_CHAT_SESSION_KEY);
-    aiChatMessages = Array.isArray(saved?.messages) ? saved.messages : [];
-  } catch (_) {
-    aiChatMessages = [];
-  }
-  renderChatHistory();
+  aiChatMessages = [];
+  return;
 }
 
 async function clearChatHistory() {
   aiChatMessages = [];
-  try {
-    await API.deleteChatHistory(AI_CHAT_SESSION_KEY);
-  } catch (_) {}
-  renderChatHistory();
-  clearChatAttachment({ silent: true });
-  showToast('Đã xóa lịch sử chat', 'info');
+  return;
 }
 
 // ---- AI CHAT PANEL (FAB bubble) ----
 let aiChatOpen = false;
 function toggleAIChat() {
-  aiChatOpen = !aiChatOpen;
-  const panel = document.getElementById('aiChatPanel');
-  const fab = document.getElementById('aiFab');
-  if (panel) panel.classList.toggle('collapsed', !aiChatOpen);
-  if (fab) fab.classList.toggle('hidden', aiChatOpen);
+  return;
 }
 
 // ---- AI IMAGE UPLOAD ----
@@ -2314,30 +3284,14 @@ const aiImageAnalysis = [
 ];
 
 function handleAIImageUpload(event) {
-  const file = event.target.files[0];
-  if (!file) return;
-  event.target.value = '';
-  try {
-    const previewUrl = URL.createObjectURL(file);
-    setChatAttachment(file, previewUrl, file.name);
-  } catch (_) {
-    setChatAttachment(file, '', file.name);
-  }
+  return;
 }
 
 // ---- AI CHAT TABS & FOLDER BROWSER ----
 let aiCurrentFolder = null; // null = root (show folders), string = inside folder
 
 function switchAITab(tab, btn) {
-  document.querySelectorAll('.ai-tab').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.ai-tab-content').forEach(c => c.classList.remove('active'));
-  btn.classList.add('active');
-  if (tab === 'chat') {
-    document.getElementById('aiTabChat')?.classList.add('active');
-  } else {
-    document.getElementById('aiTabFolders')?.classList.add('active');
-    renderAIFolderGrid();
-  }
+  return;
 }
 
 function renderAIFolderGrid() {
@@ -2593,29 +3547,158 @@ function renderKPIChart() {
   });
 }
 
+// ---- SMOOTH PROGRESS TIMER ----
+// Increments pct for in-progress library items every second using an asymptotic formula
+// so progress visually advances even when the provider API reports the same value for a while.
+// Direct DOM updates (no full re-render) let the CSS transition animate each small step.
+function startSmoothProgressTimer() {
+  if (_smoothProgressTimer) clearInterval(_smoothProgressTimer);
+  _smoothProgressTimer = setInterval(() => {
+    try {
+      const token = (typeof API !== 'undefined' && API && typeof API.getToken === 'function')
+        ? String(API.getToken() || '').trim() : '';
+      if (!token) return;
+      const processing = (Array.isArray(AppData.library) ? AppData.library : [])
+        .filter(item => String(item?.status || '').toLowerCase() === 'processing');
+      if (!processing.length) return;
+      processing.forEach(item => {
+        const current = Number(item.pct || 0) || 0;
+        if (current >= 95) return;
+        // Asymptotic: fast early, slow near 95 — mirrors real generation timing
+        const next = parseFloat(Math.min(95, current + (95 - current) * 0.02).toFixed(2));
+        if (next <= current) return;
+        item.pct = next;
+        item.progress = next;
+        // Update all matching progress bars directly — CSS transition animates the step
+        document.querySelectorAll(`[data-lib-id="${item.id}"]`).forEach(el => {
+          el.style.width = `${Math.max(2, next)}%`;
+        });
+      });
+      // Also increment creator task rows (they track progress separately)
+      if (typeof window._smoothCreatorTaskProgress === 'function') {
+        window._smoothCreatorTaskProgress();
+      }
+    } catch (_) {}
+  }, 1000);
+}
+
 // ---- BACKGROUND POLLING HOOK ----
 // ---- BACKGROUND POLLING HOOK ----
 function startBackgroundPolling() {
   if (_bgPollTimer) clearInterval(_bgPollTimer);
+  startSmoothProgressTimer();
   _bgPollTimer = setInterval(async () => {
     const token = (typeof API !== 'undefined' && API && typeof API.getToken === 'function') ? String(API.getToken() || '').trim() : '';
     if (!token) return;
     try {
+      const nowTs = Date.now();
+      if ((nowTs - _lastAuthGuardAt) >= 10000) {
+        _lastAuthGuardAt = nowTs;
+        await API.getMe();
+      }
+    } catch (_) {
+      return;
+    }
+    let shouldRebuildDashboard = false;
+    try {
       const presenceUpdate = await refreshOnlinePresence();
       if (currentScreen === 'dashboard' && (presenceUpdate?.systemChanged || presenceUpdate?.sessionsChanged)) {
-        buildDashboard();
+        shouldRebuildDashboard = true;
       }
     } catch (_) {}
     try {
       await refreshNotificationBadge();
     } catch (_) {}
     try {
+      const processingRows = (Array.isArray(AppData.library) ? AppData.library : [])
+        .filter((item) => String(item?.status || '').trim().toLowerCase() === 'processing')
+        .map((item) => ({ taskId: String(item?.taskId || item?.id || '').trim(), ref: item }))
+        .filter((row) => row.taskId)
+        .slice(0, 30);
+      if (processingRows.length && API && typeof API.pollVideoBatch === 'function') {
+        const polled = await API.pollVideoBatch(processingRows.map((row) => row.taskId));
+        const items = Array.isArray(polled?.items) ? polled.items : [];
+        const byId = new Map(items.map((row) => [String(row?.task_id || '').trim(), row]));
+        let changedProcessing = false;
+        for (const row of processingRows) {
+          const p = byId.get(row.taskId);
+          if (!p) continue;
+          const ref = row.ref;
+          const state = String(p.state || '').trim().toLowerCase();
+          const nextPct = Number(p.progress || 0) || 0;
+          const nextResultUrl = String(p.result_url || '').trim();
+          const nextCoverUrl = String(p.cover_url || '').trim();
+          const nextCompletedAt = String(p.completed_at || p.completedAt || '').trim();
+          if (state === 'success') {
+            ref.status = 'done';
+            ref.pct = 100;
+            ref.resultUrl = nextResultUrl;
+            ref.coverUrl = nextCoverUrl;
+            ref.completedAt = nextCompletedAt || new Date().toISOString();
+            ref.executionTime = formatLibraryExecutionTime(ref.createdAt, ref.completedAt) || ref.executionTime || '';
+            changedProcessing = true;
+            if (!_processingDoneToastIds.has(row.taskId) && typeof showToast === 'function') {
+              _processingDoneToastIds.add(row.taskId);
+              showToast(`Task hoàn tất: ${ref.name || row.taskId}`, 'success');
+              pushClientNotification(
+                'Video hoàn tất',
+                `${ref.name || row.taskId} đã tạo xong`,
+                { type: 'video_done', taskId: row.taskId, codeTag: ref.codeTag || '', resultUrl: nextResultUrl || '' }
+              );
+            }
+          } else if (state === 'fail') {
+            ref.status = 'rejected';
+            ref.pct = 0;
+            ref.completedAt = new Date().toISOString();
+            ref.executionTime = formatLibraryExecutionTime(ref.createdAt, ref.completedAt) || ref.executionTime || '';
+            changedProcessing = true;
+          } else {
+            const currentPct = Number(ref.pct || 0) || 0;
+            ref.status = 'processing';
+            ref.pct = Math.max(currentPct, nextPct > 0 ? nextPct : Math.min(95, currentPct + 3));
+            ref.resultUrl = '';
+            ref.coverUrl = '';
+            ref.completedAt = '';
+            ref.executionTime = '';
+            changedProcessing = true;
+          }
+        }
+        if (changedProcessing) {
+          if (currentScreen === 'creator' && typeof window.syncCreatorQCFromLibrary === 'function') {
+            window.syncCreatorQCFromLibrary();
+          }
+          if (currentScreen === 'creator' && typeof window.hydrateCreatorFromRuntime === 'function') {
+            window.hydrateCreatorFromRuntime();
+          }
+          if (currentScreen === 'creator' && typeof window.renderLibraryIfChanged === 'function') {
+            window.renderLibraryIfChanged(true);
+          }
+          if (currentScreen === 'library' && typeof scheduleLibraryRender === 'function') {
+            scheduleLibraryRender({ delay: 180 });
+          }
+          if (currentScreen === 'dashboard') {
+            shouldRebuildDashboard = true;
+          }
+        }
+      }
+    } catch (_) {}
+    try {
       // Recover stuck media only when needed to avoid noisy 500 spam and extra load.
       const nowTs = Date.now();
       const hasProcessing = (Array.isArray(AppData.library) ? AppData.library : []).some((item) => String(item.status || '').toLowerCase() === 'processing');
+      const hasRecoverableHistory = (Array.isArray(AppData.activityHistory) ? AppData.activityHistory : []).some((row) => {
+        if (String(row?.source || '').trim().toLowerCase() !== 'task') return false;
+        const status = String(row?.status || '').trim().toLowerCase();
+        const resultUrl = String(row?.result_url || '').trim();
+        return (
+          status === 'pending' ||
+          status === 'processing' ||
+          ((status === 'success' || status === 'done' || status === 'fail' || status === 'failed' || status === 'rejected') && !resultUrl)
+        );
+      });
       const isCreatorOpen = currentScreen === 'creator';
       const canRecoverNow = (nowTs - _lastRecoverStuckAt) >= 60000;
-      if ((isCreatorOpen || hasProcessing) && canRecoverNow) {
+      if ((isCreatorOpen || hasProcessing || hasRecoverableHistory) && canRecoverNow) {
         _lastRecoverStuckAt = nowTs;
         await API.recoverStuckMedia();
       }
@@ -2626,10 +3709,43 @@ function startBackgroundPolling() {
         return status === 'processing' || status === 'pending_qc';
       });
       const shouldRefreshLibrary = currentScreen === 'creator' || currentScreen === 'library' || currentScreen === 'dashboard' || hasProcessing;
-      if (shouldRefreshLibrary) {
+        if (shouldRefreshLibrary) {
         const lib = await API.getLibrary();
         if (Array.isArray(lib)) {
           const normalizedLibrary = lib.map(normalizeLibraryItem).filter(shouldKeepLibraryItem);
+          // Preserve locally-accumulated pct for in-progress items. A full refresh would
+          // otherwise reset pct back to whatever the backend last persisted (e.g. 7%),
+          // wiping synthetic increments and causing visible progress to jump backwards.
+          const existingByTaskId = new Map(AppData.library.map(i => [String(i.taskId || i.id || ''), i]));
+          normalizedLibrary.forEach(item => {
+            const id = String(item.taskId || item.id || '');
+            const existing = existingByTaskId.get(id);
+            item.codeTag = getStableLibraryCodeTag(item, existing);
+            if (
+              existing &&
+              String(existing.resultUrl || '').trim() &&
+              ['done', 'approved', 'rejected', 'pending_qc'].includes(String(existing.status || '').toLowerCase()) &&
+              ['processing', 'pending', 'running', 'queued'].includes(String(item.status || '').toLowerCase())
+            ) {
+              item.status = existing.status;
+              item.qcStatus = existing.qcStatus || item.qcStatus || null;
+              item.qcNote = existing.qcNote || item.qcNote || '';
+              item.qcReviewer = existing.qcReviewer || item.qcReviewer || '';
+              item.qcReviewedAt = existing.qcReviewedAt || item.qcReviewedAt || '';
+              item.resultUrl = existing.resultUrl;
+              item.coverUrl = existing.coverUrl || item.coverUrl || '';
+              item.pct = 100;
+              item.progress = 100;
+              item.completedAt = existing.completedAt || item.completedAt || '';
+              item.executionTime = existing.executionTime || item.executionTime || '';
+              return;
+            }
+            if (existing && String(item.status || '').toLowerCase() === 'processing') {
+              const keepPct = Math.max(Number(existing.pct || 0) || 0, Number(item.pct || 0) || 0);
+              item.pct = keepPct;
+              item.progress = keepPct;
+            }
+          });
           const beforeSignature = getLibraryCollectionSignature(AppData.library);
           const nextSignature = getLibraryCollectionSignature(normalizedLibrary);
           if (beforeSignature !== nextSignature) {
@@ -2637,12 +3753,13 @@ function startBackgroundPolling() {
             if (typeof window.syncCreatorQCFromLibrary === 'function') {
               window.syncCreatorQCFromLibrary();
             }
-            if (currentScreen === 'library') buildLibrary();
-            if (currentScreen === 'dashboard') buildDashboard();
+            if (currentScreen === 'creator' && typeof window.hydrateCreatorFromRuntime === 'function') {
+              window.hydrateCreatorFromRuntime();
+            }
+            if (currentScreen === 'library' && typeof scheduleLibraryRender === 'function') scheduleLibraryRender({ delay: 180 });
+            if (currentScreen === 'dashboard') shouldRebuildDashboard = true;
             if (currentScreen === 'creator' && typeof window.renderLibraryIfChanged === 'function') {
               window.renderLibraryIfChanged(true);
-            } else if (currentScreen === 'creator' && typeof window.renderLibrary === 'function') {
-              window.renderLibrary();
             }
           }
         }
@@ -2653,11 +3770,78 @@ function startBackgroundPolling() {
         await refreshQCQueue({ silent: true });
       }
     } catch (_) {}
-  }, 15000);
+    if (currentScreen === 'dashboard' && shouldRebuildDashboard) {
+      try {
+        if (typeof isDashboardInteractionActive === 'function' && isDashboardInteractionActive()) {
+          if (typeof dashboardRebuildPending !== 'undefined') dashboardRebuildPending = true;
+        } else if (typeof flushPendingDashboardRebuild === 'function') {
+          if (!flushPendingDashboardRebuild()) buildDashboard();
+        } else {
+          buildDashboard();
+        }
+      } catch (_) {}
+    }
+  }, 5000);
 }
 
 // ---- TOAST NOTIFICATIONS ----
+function isCreditExhaustedUiMessage(message) {
+  const text = String(message || '').trim().toLowerCase();
+  if (!text) return false;
+  return [
+    'hết tiền',
+    'het tien',
+    'không đủ credit',
+    'khong du credit',
+    'không có key đơn lẻ đủ',
+    'khong co key don le du',
+    'key đơn lẻ',
+    'key don le',
+    'insufficient',
+    'out of credit',
+    'out of credits',
+    'not enough credit',
+    'credit exhausted',
+    '402',
+  ].some((token) => text.includes(token));
+}
+
+function showCreditExhaustedPopup() {
+  const popupId = 'creditExhaustedPopup';
+  const existing = document.getElementById(popupId);
+  if (existing) existing.remove();
+  const overlay = document.createElement('div');
+  overlay.id = popupId;
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.48);display:flex;align-items:center;justify-content:center;z-index:10040;padding:20px;';
+  overlay.innerHTML = `
+    <div style="width:min(460px,calc(100vw - 32px));background:var(--card);border:1px solid rgba(196,74,58,.45);border-radius:16px;box-shadow:0 16px 60px rgba(0,0,0,.5);overflow:hidden">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 18px;border-bottom:1px solid var(--border);background:rgba(196,74,58,.10)">
+        <div style="font-size:18px;font-weight:800;color:var(--red)">Hết tiền!</div>
+        <button type="button" id="creditExhaustedPopupClose" style="width:34px;height:34px;border-radius:10px;border:1px solid var(--border);background:var(--bg2);color:var(--text);cursor:pointer"><i class="fa-solid fa-xmark"></i></button>
+      </div>
+      <div style="padding:20px 18px 10px;font-size:15px;line-height:1.6;color:var(--text);white-space:pre-wrap">Liên hệ QChi để nạp card!</div>
+      <div style="display:flex;justify-content:flex-end;padding:0 18px 18px">
+        <button type="button" id="creditExhaustedPopupOk" style="height:38px;padding:0 16px;border-radius:10px;border:1px solid rgba(196,74,58,.45);background:rgba(196,74,58,.14);color:var(--red);font-size:13px;font-weight:700;cursor:pointer">Đã hiểu</button>
+      </div>
+    </div>
+  `;
+  const close = () => overlay.remove();
+  overlay.addEventListener('click', (ev) => {
+    if (ev.target === overlay) close();
+  });
+  document.body.appendChild(overlay);
+  document.getElementById('creditExhaustedPopupClose')?.addEventListener('click', close);
+  document.getElementById('creditExhaustedPopupOk')?.addEventListener('click', close);
+}
+
 function showToast(msg, type = 'info') {
+  if (isCreditExhaustedUiMessage(msg) && ['error', 'warning', 'info'].includes(String(type || '').trim().toLowerCase())) {
+    showCreditExhaustedPopup();
+    return;
+  }
+  if (window.AppMonitor && typeof window.AppMonitor.increment === 'function') {
+    window.AppMonitor.increment(`toast_${String(type || 'info').trim().toLowerCase()}`);
+  }
   let container = document.getElementById('toastContainer');
   if (!container) {
     container = document.createElement('div');
@@ -2686,3 +3870,4 @@ function showToast(msg, type = 'info') {
     setTimeout(() => toast.remove(), 300);
   }, 3000);
 }
+window.showCreditExhaustedPopup = showCreditExhaustedPopup;
