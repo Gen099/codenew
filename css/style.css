@@ -637,6 +637,12 @@ tbody tr:last-child td { border-bottom: none; }
   text-align: center;
 }
 
+.account-switch-modal {
+  width: min(760px, calc(100vw - 32px));
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+}
+
 .modal-box h2 {
   font-size: 18px;
   margin-bottom: 10px;
@@ -687,7 +693,7 @@ tbody tr:last-child td { border-bottom: none; }
 
 .role-options {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 10px;
   margin: 16px 0;
 }

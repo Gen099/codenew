@@ -1932,6 +1932,7 @@ function showRoleSwitcher() {
   const modal = document.getElementById('roleModal');
   const title = modal?.querySelector('h2');
   const options = modal?.querySelector('.role-options');
+  modal?.querySelector('.modal-box')?.classList.add('account-switch-modal');
   if (title) title.textContent = 'Chuy\u1ec3n \u0111\u1ed5i t\u00e0i kho\u1ea3n xem';
   if (options) {
     const auth = AppData.authUser || AppData.currentUser;
